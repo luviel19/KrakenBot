@@ -4,10 +4,12 @@ import asyncio
 import json
 import logging
 import os
+import time
+from datetime import datetime
 from pathlib import Path
 
 import discord
-from discord import ui
+from discord import app_commands, ui
 
 # ---------------------------------------------------------------- настройки
 
@@ -19,6 +21,17 @@ TICKET_CHANNEL_NAME = "тикеты"
 STAFF_CHANNEL_ID = None  # бот запомнит созданный канал сам; можно вписать id вручную
 STAFF_CHANNEL_NAME = "функционал-бота"  # видит только STAFF_ROLE_ID
 DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
+TICKET_COOLDOWN = 120  # секунд между тикетами одного игрока (на роль поддержки не действует)
+
+GAME_NAME = "FISHING UNBOUND"
+GAME_INFO = (
+    f"Добро пожаловать в сообщество {GAME_NAME}!\n\n"
+    "Мы создаём рыболовную игру с акцентом на реалистичные снасти, "
+    "поведение рыбы и атмосферу настоящей рыбалки.\n\n"
+    "Здесь можно следить за официальными новостями разработки, "
+    "предлагать идеи и сообщать об ошибках."
+)
+GAME_COLOR = discord.Color.from_rgb(36, 116, 132)
 
 # ключ -> (название, эмодзи, описание в выпадающем списке)
 CATEGORIES = {
@@ -63,7 +76,10 @@ class Storage:
     def __init__(self, path: Path):
         self.path = path
         self.lock = asyncio.Lock()
-        self.data = {"counters": {}, "panels": {}, "staff_panels": {}, "tickets": {}, "polls": {}}
+        self.data = {
+            "counters": {}, "panels": {}, "staff_panels": {}, "tickets": {}, "polls": {},
+            "news": {}, "progress": {},
+        }
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
 
@@ -90,6 +106,7 @@ class Storage:
 
 
 storage = Storage(DATA_FILE)
+last_ticket_at: dict[tuple[int, int], float] = {}
 
 
 def is_staff(member: discord.abc.User) -> bool:
@@ -124,6 +141,12 @@ class TicketModal(ui.Modal, title="Новый тикет"):
         component=ui.TextInput(placeholder="Например: 1.4.2, Windows", required=False, max_length=100),
     )
 
+    def __init__(self, category: str | None = None):
+        super().__init__()
+        if category:
+            for option in self.category.component.options:
+                option.default = option.value == category
+
     async def on_submit(self, interaction: discord.Interaction):
         await create_ticket(
             interaction,
@@ -146,6 +169,15 @@ async def create_ticket(interaction: discord.Interaction, *, category_key, subje
     if channel is None:
         await interaction.response.send_message("Канал тикетов не найден, напишите администрации.", ephemeral=True)
         return
+
+    key = (interaction.guild.id, interaction.user.id)
+    wait = TICKET_COOLDOWN - (time.monotonic() - last_ticket_at.get(key, -TICKET_COOLDOWN))
+    if wait > 0 and not is_staff(interaction.user):
+        await interaction.response.send_message(
+            f"⏳ Следующий тикет можно создать через {int(wait) + 1} сек.", ephemeral=True
+        )
+        return
+    last_ticket_at[key] = time.monotonic()
 
     await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -301,10 +333,12 @@ class StatusView(ui.View):
 # ---------------------------------------------------------------- опросы
 
 
-class PollModal(ui.Modal, title="Новый опрос"):
+class PostModal(ui.Modal):
+    """Пост от команды: опрос (с кнопкой «Есть идея») или новость."""
+
     target = ui.Label(
         text="Канал",
-        description="Куда отправить опрос",
+        description="Куда отправить пост",
         component=ui.ChannelSelect(
             channel_types=[discord.ChannelType.text, discord.ChannelType.news],
             placeholder="Выберите канал",
@@ -335,6 +369,14 @@ class PollModal(ui.Modal, title="Новый опрос"):
         component=ui.FileUpload(required=False, max_values=10),
     )
 
+    def __init__(self, kind: str):
+        self.kind = kind
+        super().__init__(title="Новый опрос" if kind == "poll" else "Новая новость")
+        if kind == "news":
+            self.poll_title.component.placeholder = "Например: Обновление 0.3 — новые снасти"
+            self.text.description = "Что изменилось, что исправили, что дальше"
+            self.images.text = "Картинки"
+
     async def on_submit(self, interaction: discord.Interaction):
         channel = interaction.guild.get_channel(self.target.component.values[0].id)
         if channel is None:
@@ -343,15 +385,19 @@ class PollModal(ui.Modal, title="Новый опрос"):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        is_poll = self.kind == "poll"
         title = self.poll_title.component.value
         embed = discord.Embed(
-            title=f"📢 {title}",
+            title=f"{'📢' if is_poll else '📰'} {title}",
             description=self.text.component.value,
-            color=discord.Color.blurple(),
+            color=discord.Color.blurple() if is_poll else discord.Color.gold(),
             timestamp=discord.utils.utcnow(),
         )
         embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
-        embed.set_footer(text="Есть мысли? Нажмите «Есть идея» — ответ увидит только команда")
+        embed.set_footer(
+            text="Есть мысли? Нажмите «Есть идея» — ответ увидит только команда"
+            if is_poll else f"Новости {GAME_NAME}"
+        )
 
         files = [await a.to_file() for a in self.images.component.values]
         for i, f in enumerate(files, 1):
@@ -365,25 +411,34 @@ class PollModal(ui.Modal, title="Новый опрос"):
                 content=MENTIONS[mention_key] if mention_key != "none" else None,
                 embeds=embeds,
                 files=files,
-                view=PollView(),
+                view=PollView() if is_poll else None,
                 allowed_mentions=discord.AllowedMentions(everyone=True),
             )
         except discord.Forbidden:
             await interaction.followup.send(f"У бота нет прав писать в {channel.mention}.", ephemeral=True)
             return
 
-        await storage.set("polls", message.id, {
-            "title": title,
-            "channel_id": channel.id,
-            "author_id": interaction.user.id,
-            "ideas": 0,
-        })
-        await interaction.followup.send(f"Опрос опубликован: {message.jump_url}", ephemeral=True)
+        if is_poll:
+            await storage.set("polls", message.id, {
+                "title": title,
+                "channel_id": channel.id,
+                "author_id": interaction.user.id,
+                "ideas": 0,
+            })
+        else:
+            news = storage.get("news", interaction.guild.id) or []
+            news.insert(0, {"title": title, "text": self.text.component.value, "url": message.jump_url,
+                            "date": discord.utils.utcnow().isoformat()})
+            await storage.set("news", interaction.guild.id, news[:10])
+        await interaction.followup.send(
+            f"{'Опрос' if is_poll else 'Новость'} опубликован{'' if is_poll else 'а'}: {message.jump_url}",
+            ephemeral=True,
+        )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
-        log.exception("Ошибка при создании опроса", exc_info=error)
+        log.exception("Ошибка при публикации поста", exc_info=error)
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
-        await send("Не удалось опубликовать опрос, попробуйте ещё раз.", ephemeral=True)
+        await send("Не удалось опубликовать пост, попробуйте ещё раз.", ephemeral=True)
 
 
 def is_image(filename: str) -> bool:
@@ -457,7 +512,133 @@ class StaffPanelView(ui.View):
 
     @ui.button(label="Создать опрос", emoji="📢", style=discord.ButtonStyle.primary, custom_id="staff:poll")
     async def poll(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(PollModal())
+        await interaction.response.send_modal(PostModal("poll"))
+
+    @ui.button(label="Опубликовать новость", emoji="📰", style=discord.ButtonStyle.primary, custom_id="staff:news")
+    async def news(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(PostModal("news"))
+
+    @ui.button(label="Ход разработки", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="staff:progress")
+    async def progress(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(ProgressModal(interaction.guild.id))
+
+    @ui.button(label="Панель сообщества", emoji="📌", style=discord.ButtonStyle.secondary, custom_id="staff:hub")
+    async def hub(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(HubModal())
+
+
+class ProgressModal(ui.Modal, title="Ход разработки"):
+    text = ui.Label(
+        text="Сводка",
+        description="Что сейчас в работе. Игроки увидят это по кнопке «Разработка» и /progress",
+        component=ui.TextInput(style=discord.TextStyle.paragraph, max_length=3500),
+    )
+
+    def __init__(self, guild_id: int):
+        super().__init__()
+        current = storage.get("progress", guild_id)
+        if current:
+            self.text.component.default = current["text"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await storage.set("progress", interaction.guild.id, {
+            "text": self.text.component.value,
+            "date": discord.utils.utcnow().isoformat(),
+        })
+        await interaction.response.send_message("✅ Сводка обновлена.", embed=progress_embed(interaction.guild.id),
+                                                ephemeral=True)
+
+
+class HubModal(ui.Modal, title="Панель сообщества"):
+    target = ui.Label(
+        text="Канал",
+        description="Куда отправить панель с кнопками для игроков",
+        component=ui.ChannelSelect(channel_types=[discord.ChannelType.text], required=True),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel = interaction.guild.get_channel(self.target.component.values[0].id)
+        try:
+            message = await channel.send(embed=hub_embed(), view=HubView())
+        except (discord.Forbidden, AttributeError):
+            await interaction.response.send_message("У бота нет прав писать в этот канал.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"✅ Панель опубликована: {message.jump_url}\nЕё можно закрепить.", ephemeral=True
+        )
+
+
+# ---------------------------------------------------------------- центр сообщества
+
+
+def hub_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🐙 {GAME_NAME} | Центр сообщества",
+        description=(
+            "**Добро пожаловать, рыболов!** 🎣\n\n"
+            "Читайте новости, следите за разработкой, делитесь идеями "
+            "и сообщайте об ошибках с помощью кнопок ниже."
+        ),
+        color=GAME_COLOR,
+    )
+    embed.set_footer(text="Идеи и ошибки уходят приватным тикетом — их видите только вы и команда")
+    return embed
+
+
+def info_embed() -> discord.Embed:
+    embed = discord.Embed(title=f"🎣 {GAME_NAME}", description=GAME_INFO, color=GAME_COLOR)
+    embed.set_footer(text=f"{GAME_NAME} • Новости и статусы публикует команда разработки")
+    return embed
+
+
+def news_embed(guild_id: int) -> discord.Embed:
+    embed = discord.Embed(title="📰 Новости разработки", color=discord.Color.gold())
+    news = storage.get("news", guild_id) or []
+    if not news:
+        embed.description = "Официальных публикаций пока нет. Загляните позже!"
+    for item in news[:4]:
+        text = item["text"] if len(item["text"]) <= 300 else item["text"][:300].rstrip() + "…"
+        date = discord.utils.format_dt(datetime.fromisoformat(item["date"]), "d")
+        embed.add_field(name=item["title"][:256], value=f"{text}\n{date} · [Читать]({item['url']})", inline=False)
+    return embed
+
+
+def progress_embed(guild_id: int) -> discord.Embed:
+    embed = discord.Embed(title="🛠️ Ход разработки", color=discord.Color.teal())
+    progress = storage.get("progress", guild_id)
+    if progress:
+        embed.description = progress["text"]
+        embed.timestamp = datetime.fromisoformat(progress["date"])
+        embed.set_footer(text="Обновлено")
+    else:
+        embed.description = "Команда пока не опубликовала сводку разработки."
+    return embed
+
+
+class HubView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @ui.button(label="Об игре", emoji="🎣", style=discord.ButtonStyle.secondary, custom_id="hub:about")
+    async def about(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(embed=info_embed(), ephemeral=True)
+
+    @ui.button(label="Новости", emoji="📰", style=discord.ButtonStyle.secondary, custom_id="hub:news")
+    async def news(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(embed=news_embed(interaction.guild.id), ephemeral=True)
+
+    @ui.button(label="Разработка", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="hub:progress")
+    async def progress(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message(embed=progress_embed(interaction.guild.id), ephemeral=True)
+
+    @ui.button(label="Идея", emoji="💡", style=discord.ButtonStyle.success, custom_id="hub:idea")
+    async def idea(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(TicketModal("suggestion"))
+
+    @ui.button(label="Ошибка", emoji="🐞", style=discord.ButtonStyle.primary, custom_id="hub:bug")
+    async def bug(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(TicketModal("bug"))
+
 
 
 # ---------------------------------------------------------------- бот
@@ -467,6 +648,8 @@ class KrakenBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         self.ready_once = False
+        self.tree = app_commands.CommandTree(self)
+        self.add_player_commands()
 
     async def setup_hook(self):
         # кнопки продолжают работать после перезапуска бота
@@ -474,6 +657,38 @@ class KrakenBot(discord.Client):
         self.add_view(StatusView())
         self.add_view(PollView())
         self.add_view(StaffPanelView())
+        self.add_view(HubView())
+
+    def add_player_commands(self):
+        @self.tree.command(name="info", description=f"Информация о {GAME_NAME}")
+        @app_commands.guild_only()
+        async def info(interaction: discord.Interaction):
+            await interaction.response.send_message(embed=info_embed(), ephemeral=True)
+
+        @self.tree.command(name="news", description="Последние новости разработки")
+        @app_commands.guild_only()
+        async def news(interaction: discord.Interaction):
+            await interaction.response.send_message(embed=news_embed(interaction.guild.id), ephemeral=True)
+
+        @self.tree.command(name="progress", description="Ход разработки")
+        @app_commands.guild_only()
+        async def progress(interaction: discord.Interaction):
+            await interaction.response.send_message(embed=progress_embed(interaction.guild.id), ephemeral=True)
+
+        @self.tree.command(name="idea", description="Предложить идею для игры")
+        @app_commands.guild_only()
+        async def idea(interaction: discord.Interaction):
+            await interaction.response.send_modal(TicketModal("suggestion"))
+
+        @self.tree.command(name="bug", description="Сообщить об ошибке в игре")
+        @app_commands.guild_only()
+        async def bug(interaction: discord.Interaction):
+            await interaction.response.send_modal(TicketModal("bug"))
+
+        @self.tree.command(name="ticket", description="Создать тикет")
+        @app_commands.guild_only()
+        async def ticket(interaction: discord.Interaction):
+            await interaction.response.send_modal(TicketModal())
 
     async def on_ready(self):
         log.info("Вошёл как %s", self.user)
@@ -495,6 +710,14 @@ class KrakenBot(discord.Client):
                 await self.ensure_staff_panel(staff_channel)
         except discord.Forbidden:
             log.error("Сервер %s: боту не хватает прав (нужны «Управлять каналами» и «Управлять ролями»)", guild)
+
+        # регистрация на конкретном сервере появляется сразу, глобальная — до часа
+        self.tree.copy_global_to(guild=guild)
+        try:
+            synced = await self.tree.sync(guild=guild)
+            log.info("Сервер %s: зарегистрировано команд: %s", guild, len(synced))
+        except discord.Forbidden:
+            log.error("Сервер %s: нет доступа к командам — пригласите бота со scope applications.commands", guild)
 
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
         staff = guild.get_role(STAFF_ROLE_ID)
@@ -567,25 +790,24 @@ class KrakenBot(discord.Client):
         return channel
 
     async def ensure_staff_panel(self, channel: discord.TextChannel):
-        if await panel_exists(channel, "staff_panels", "staff:poll"):
-            return
         tickets = ticket_channel(channel.guild)
+        tickets = tickets.mention if tickets else "#" + TICKET_CHANNEL_NAME
         embed = discord.Embed(
             title="🛠️ Функционал бота",
             description=(
-                "**📢 Создать опрос** — публикует пост в выбранный канал с кнопкой **«💡 Есть идея»**.\n"
-                f"Игрок нажимает кнопку, пишет идею — и она приходит тикетом в {tickets.mention if tickets else '#' + TICKET_CHANNEL_NAME} "
-                "со ссылкой на опрос. Статусы у таких тикетов те же, что и у обычных."
+                "**📢 Создать опрос** — пост в выбранный канал с кнопкой **«💡 Есть идея»**. "
+                f"Идеи игроков приходят тикетами в {tickets} со ссылкой на опрос.\n\n"
+                "**📰 Опубликовать новость** — пост в выбранный канал. Последние новости игроки "
+                "видят по кнопке «Новости» и команде `/news`.\n\n"
+                "**🛠️ Ход разработки** — сводка, которую игроки видят по кнопке «Разработка» и `/progress`.\n\n"
+                "**📌 Панель сообщества** — сообщение с кнопками для игроков: "
+                "Об игре · Новости · Разработка · Идея · Ошибка."
             ),
             color=discord.Color.dark_teal(),
         )
-        message = await channel.send(embed=embed, view=StaffPanelView())
-        await storage.set("staff_panels", channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
+        await upsert_panel(channel, "staff_panels", "staff:poll", embed, StaffPanelView())
 
     async def ensure_panel(self, channel: discord.TextChannel):
-        if await panel_exists(channel, "panels", "ticket:create"):
-            return
-
         embed = discord.Embed(
             title="🎫 Тикеты",
             description=(
@@ -600,17 +822,26 @@ class KrakenBot(discord.Client):
             value="\n".join(f"{emoji} **{label}** — {desc}" for label, emoji, desc in CATEGORIES.values()),
             inline=False,
         )
-        message = await channel.send(embed=embed, view=PanelView())
-        await storage.set("panels", channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
+        await upsert_panel(channel, "panels", "ticket:create", embed, PanelView())
 
 
-async def panel_exists(channel: discord.TextChannel, section: str, custom_id: str) -> bool:
-    """Есть ли в канале сообщение-панель бота с кнопкой custom_id (запоминает его, если нашлось)."""
+async def upsert_panel(channel: discord.TextChannel, section: str, custom_id: str,
+                       embed: discord.Embed, view: ui.View):
+    """Обновляет сообщение-панель бота в канале или отправляет новое, если его нет."""
+    message = await find_panel(channel, section, custom_id)
+    if message is None:
+        message = await channel.send(embed=embed, view=view)
+    else:
+        await message.edit(embed=embed, view=view)
+    await storage.set(section, channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
+
+
+async def find_panel(channel: discord.TextChannel, section: str, custom_id: str) -> discord.Message | None:
+    """Сообщение-панель бота с кнопкой custom_id: сначала по запомненному id, потом поиском в истории."""
     panel = storage.get(section, channel.guild.id)
     if panel and panel["channel_id"] == channel.id:
         try:
-            await channel.fetch_message(panel["message_id"])
-            return True
+            return await channel.fetch_message(panel["message_id"])
         except discord.NotFound:
             pass
 
@@ -620,9 +851,8 @@ async def panel_exists(channel: discord.TextChannel, section: str, custom_id: st
             for row in message.components
             for item in getattr(row, "children", [])
         ):
-            await storage.set(section, channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
-            return True
-    return False
+            return message
+    return None
 
 
 def load_dotenv(path: Path):
