@@ -12,7 +12,11 @@ from discord import ui
 # ---------------------------------------------------------------- настройки
 
 STAFF_ROLE_ID = 898463898582253568
-TICKET_CHANNEL_NAME = "тикеты"  # Discord хранит имена текстовых каналов в нижнем регистре
+# Каналы ищутся по id, поэтому их можно спокойно переименовывать.
+# Имя используется, только если канала с таким id нет и его нужно создать.
+TICKET_CHANNEL_ID = 1571844747327316069
+TICKET_CHANNEL_NAME = "тикеты"
+STAFF_CHANNEL_ID = None  # бот запомнит созданный канал сам; можно вписать id вручную
 STAFF_CHANNEL_NAME = "функционал-бота"  # видит только STAFF_ROLE_ID
 DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
 
@@ -186,9 +190,17 @@ async def create_ticket(interaction: discord.Interaction, *, category_key, subje
 
 
 def ticket_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    panel = storage.get("panels", guild.id)
-    channel = guild.get_channel(panel["channel_id"]) if panel else None
-    return channel or discord.utils.get(guild.text_channels, name=TICKET_CHANNEL_NAME)
+    return find_channel(guild, TICKET_CHANNEL_ID, "panels", TICKET_CHANNEL_NAME)
+
+
+def find_channel(guild: discord.Guild, channel_id, section: str, name: str) -> discord.TextChannel | None:
+    """Канал по id из настроек, затем по id, который бот запомнил, и только потом по имени."""
+    panel = storage.get(section, guild.id)
+    for cid in (channel_id, panel and panel["channel_id"]):
+        channel = guild.get_channel(cid) if cid else None
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    return discord.utils.get(guild.text_channels, name=name)
 
 
 def ticket_embed(*, number, category_key, author, subject, description, version,
@@ -342,15 +354,16 @@ class PollModal(ui.Modal, title="Новый опрос"):
         embed.set_footer(text="Есть мысли? Нажмите «Есть идея» — ответ увидит только команда")
 
         files = [await a.to_file() for a in self.images.component.values]
-        image = next((f for f in files if f.filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))), None)
-        if image is not None:
-            embed.set_image(url=f"attachment://{image.filename}")
+        for i, f in enumerate(files, 1):
+            # вставленные из буфера картинки все называются image.png — attachment:// перепутал бы их
+            f.filename = f"ref{i}{Path(f.filename).suffix.lower()}"
+        embeds = gallery_embeds(embed, [f.filename for f in files if is_image(f.filename)], channel.jump_url)
 
         mention_key = self.mention.component.values[0]
         try:
             message = await channel.send(
                 content=MENTIONS[mention_key] if mention_key != "none" else None,
-                embed=embed,
+                embeds=embeds,
                 files=files,
                 view=PollView(),
                 allowed_mentions=discord.AllowedMentions(everyone=True),
@@ -371,6 +384,26 @@ class PollModal(ui.Modal, title="Новый опрос"):
         log.exception("Ошибка при создании опроса", exc_info=error)
         send = interaction.followup.send if interaction.response.is_done() else interaction.response.send_message
         await send("Не удалось опубликовать опрос, попробуйте ещё раз.", ephemeral=True)
+
+
+def is_image(filename: str) -> bool:
+    return filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def gallery_embeds(main: discord.Embed, images: list[str], base_url: str) -> list[discord.Embed]:
+    """Картинки внутри поста сеткой: Discord склеивает до 4 эмбедов с одинаковым url в одну галерею."""
+    embeds = [main]
+    for start in range(0, len(images), 4):
+        url = base_url if start == 0 else f"{base_url}?gallery={start // 4}"
+        for i, filename in enumerate(images[start:start + 4]):
+            if start == 0 and i == 0:
+                embed = main
+            else:
+                embed = discord.Embed(url=url, color=main.color)
+                embeds.append(embed)
+            embed.url = url
+            embed.set_image(url=f"attachment://{filename}")
+    return embeds
 
 
 class IdeaModal(ui.Modal, title="Ваша идея"):
@@ -499,7 +532,7 @@ class KrakenBot(discord.Client):
                 manage_threads=True,
             )
 
-        channel = discord.utils.get(guild.text_channels, name=TICKET_CHANNEL_NAME)
+        channel = ticket_channel(guild)
         if channel is None:
             channel = await guild.create_text_channel(
                 TICKET_CHANNEL_NAME,
@@ -523,7 +556,7 @@ class KrakenBot(discord.Client):
                 view_channel=True, send_messages=True, embed_links=True, read_message_history=True
             ),
         }
-        channel = discord.utils.get(guild.text_channels, name=STAFF_CHANNEL_NAME)
+        channel = find_channel(guild, STAFF_CHANNEL_ID, "staff_panels", STAFF_CHANNEL_NAME)
         if channel is None:
             channel = await guild.create_text_channel(
                 STAFF_CHANNEL_NAME, overwrites=overwrites, topic="Функционал бота для команды", reason="Канал команды"
@@ -534,7 +567,7 @@ class KrakenBot(discord.Client):
         return channel
 
     async def ensure_staff_panel(self, channel: discord.TextChannel):
-        if await panel_exists(channel, "staff_panels"):
+        if await panel_exists(channel, "staff_panels", "staff:poll"):
             return
         tickets = ticket_channel(channel.guild)
         embed = discord.Embed(
@@ -550,7 +583,7 @@ class KrakenBot(discord.Client):
         await storage.set("staff_panels", channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
 
     async def ensure_panel(self, channel: discord.TextChannel):
-        if await panel_exists(channel, "panels"):
+        if await panel_exists(channel, "panels", "ticket:create"):
             return
 
         embed = discord.Embed(
@@ -571,15 +604,25 @@ class KrakenBot(discord.Client):
         await storage.set("panels", channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
 
 
-async def panel_exists(channel: discord.TextChannel, section: str) -> bool:
+async def panel_exists(channel: discord.TextChannel, section: str, custom_id: str) -> bool:
+    """Есть ли в канале сообщение-панель бота с кнопкой custom_id (запоминает его, если нашлось)."""
     panel = storage.get(section, channel.guild.id)
-    if not panel or panel["channel_id"] != channel.id:
-        return False
-    try:
-        await channel.fetch_message(panel["message_id"])
-        return True
-    except discord.NotFound:
-        return False
+    if panel and panel["channel_id"] == channel.id:
+        try:
+            await channel.fetch_message(panel["message_id"])
+            return True
+        except discord.NotFound:
+            pass
+
+    async for message in channel.history(limit=100):
+        if message.author == channel.guild.me and any(
+            getattr(item, "custom_id", None) == custom_id
+            for row in message.components
+            for item in getattr(row, "children", [])
+        ):
+            await storage.set(section, channel.guild.id, {"channel_id": channel.id, "message_id": message.id})
+            return True
+    return False
 
 
 def load_dotenv(path: Path):
