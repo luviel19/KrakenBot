@@ -4,8 +4,8 @@
 1. https://discord.com/developers/applications → New Application → Bot → скопировать токен.
 2. OAuth2 → URL Generator: отметить только `bot`, ниже в «Разрешениях бота» — Manage Channels,
    Manage Roles, View Channels, Send Messages, Send Messages in Threads, Create Private Threads,
-   Manage Threads, Manage Messages, Embed Links, Read Message History, Mention Everyone.
-   Или готовая ссылка: `https://discord.com/oauth2/authorize?client_id=ID_ПРИЛОЖЕНИЯ&scope=bot&permissions=361045912592`
+   Manage Threads, Manage Messages, Embed Links, Attach Files, Read Message History, Mention Everyone.
+   Или готовая ссылка: `https://discord.com/oauth2/authorize?client_id=ID_ПРИЛОЖЕНИЯ&scope=bot&permissions=361045945360`
 3. `pip install -r requirements.txt`
 4. Скопировать `.env.example` в `.env` и вписать токен.
 5. `python bot.py`
@@ -27,5 +27,11 @@ docker compose up -d
 - Видят ветку только автор и роль `898463898582253568` (через право «Управлять ветками» в канале).
 - Кнопки **Взят в работу / Исправлен / Не актуально** работают только у этой роли.
   «Исправлен» и «Не актуально» архивируют и блокируют ветку; «Взят в работу» открывает её снова.
+
+## Опросы
+Бот создаёт канал `#функционал-бота`, который видит только роль `898463898582253568`.
+Кнопка **📢 Создать опрос** → форма: канал, упоминание (@everyone / @here / без), заголовок, текст, референсы (до 10 файлов).
+Под опубликованным постом кнопка **💡 Есть идея** — игрок пишет идею, и она приходит тикетом
+категории «💬 Идея к опросу» со ссылкой на пост.
 
 Настройки (роль, имя канала, категории) — в начале `bot.py`. Номера тикетов хранятся в `data.json`.
