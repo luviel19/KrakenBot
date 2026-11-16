@@ -83,23 +83,29 @@ class Storage:
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
 
-    def _save(self):
+    async def _save(self):
+        # снимок данных берём сразу, а сам файл пишем в отдельном потоке — бот в это время
+        # продолжает отвечать на нажатия; lock гарантирует, что записи не перепутаются
+        text = json.dumps(self.data, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(self._write, text)
+
+    def _write(self, text: str):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(text, encoding="utf-8")
         tmp.replace(self.path)
 
     async def next_ticket_number(self, guild_id: int) -> int:
         async with self.lock:
             number = self.data["counters"].get(str(guild_id), 0) + 1
             self.data["counters"][str(guild_id)] = number
-            self._save()
+            await self._save()
             return number
 
     async def set(self, section: str, key: int, value):
         async with self.lock:
             self.data[section][str(key)] = value
-            self._save()
+            await self._save()
 
     def get(self, section: str, key: int):
         return self.data[section].get(str(key))
@@ -541,12 +547,13 @@ class ProgressModal(ui.Modal, title="Ход разработки"):
             self.text.component.default = current["text"]
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await storage.set("progress", interaction.guild.id, {
             "text": self.text.component.value,
             "date": discord.utils.utcnow().isoformat(),
         })
-        await interaction.response.send_message("✅ Сводка обновлена.", embed=progress_embed(interaction.guild.id),
-                                                ephemeral=True)
+        await interaction.followup.send("✅ Сводка обновлена.", embed=progress_embed(interaction.guild.id),
+                                        ephemeral=True)
 
 
 class HubModal(ui.Modal, title="Панель сообщества"):
@@ -557,13 +564,14 @@ class HubModal(ui.Modal, title="Панель сообщества"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
         channel = interaction.guild.get_channel(self.target.component.values[0].id)
         try:
             message = await channel.send(embed=hub_embed(), view=HubView())
         except (discord.Forbidden, AttributeError):
-            await interaction.response.send_message("У бота нет прав писать в этот канал.", ephemeral=True)
+            await interaction.followup.send("У бота нет прав писать в этот канал.", ephemeral=True)
             return
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Панель опубликована: {message.jump_url}\nЕё можно закрепить.", ephemeral=True
         )
 
@@ -695,8 +703,8 @@ class KrakenBot(discord.Client):
         if self.ready_once:
             return
         self.ready_once = True
-        for guild in self.guilds:
-            await self.setup_guild(guild)
+        # серверы настраиваются параллельно, а не по очереди
+        await asyncio.gather(*(self.setup_guild(guild) for guild in self.guilds))
 
     async def on_guild_join(self, guild: discord.Guild):
         await self.setup_guild(guild)
