@@ -1,0 +1,11 @@
+services:
+  bot:
+    image: ghcr.io/luviel19/krakenbot:latest
+    restart: unless-stopped
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+    volumes:
+      - bot-data:/data
+
+volumes:
+  bot-data:

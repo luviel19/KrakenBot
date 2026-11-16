@@ -13,7 +13,7 @@ from discord import ui
 
 STAFF_ROLE_ID = 898463898582253568
 TICKET_CHANNEL_NAME = "тикеты"  # Discord хранит имена текстовых каналов в нижнем регистре
-DATA_FILE = Path(__file__).with_name("data.json")
+DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
 
 # ключ -> (название, эмодзи, описание в выпадающем списке)
 CATEGORIES = {
@@ -53,6 +53,7 @@ class Storage:
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
 
     def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)

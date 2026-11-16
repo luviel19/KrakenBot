@@ -2,14 +2,24 @@
 
 ## Запуск
 1. https://discord.com/developers/applications → New Application → Bot → скопировать токен.
-2. Пригласить бота (OAuth2 → URL Generator, scope `bot` + `applications.commands`) с правами:
-   Manage Channels, Manage Roles, Manage Threads, Create Private Threads,
-   Send Messages, Send Messages in Threads, Embed Links, Read Message History, View Channels.
+2. OAuth2 → URL Generator: отметить только `bot`, ниже в «Разрешениях бота» — Manage Channels,
+   Manage Roles, View Channels, Send Messages, Send Messages in Threads, Create Private Threads,
+   Manage Threads, Manage Messages, Embed Links, Read Message History, Mention Everyone.
+   Или готовая ссылка: `https://discord.com/oauth2/authorize?client_id=ID_ПРИЛОЖЕНИЯ&scope=bot&permissions=361045912592`
 3. `pip install -r requirements.txt`
 4. Скопировать `.env.example` в `.env` и вписать токен.
 5. `python bot.py`
 
 При запуске бот сам создаёт канал `#тикеты` (если его нет), выставляет права и публикует панель с кнопкой.
+
+## Docker
+Образ собирается GitHub Actions при каждом пуше в `main` и публикуется в `ghcr.io/luviel19/krakenbot:latest`.
+
+```
+echo DISCORD_TOKEN=токен > .env
+docker compose up -d
+```
+Номера тикетов хранятся в томе `/data`.
 
 ## Как работает
 - **Создать тикет** → форма: категория (выпадающий список), тема, описание, версия/платформа.
