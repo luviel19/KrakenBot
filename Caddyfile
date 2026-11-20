@@ -1,5 +1,10 @@
-# HTTPS для API новостей. Сертификат Let's Encrypt Caddy получает и продлевает сам
-# (нужен свободный порт 80 на сервере). API_DOMAIN задаётся в .env.
+# HTTPS для API новостей. Сертификат Let's Encrypt Caddy получает и продлевает сам.
+# Порт 80 на сервере занят nginx, поэтому Caddy слушает HTTP на 127.0.0.1:8088,
+# а nginx пересылает ему только проверки Let's Encrypt (deploy/nginx-acme.conf).
+{
+	http_port 8088
+}
+
 {$API_DOMAIN}:{$API_HTTPS_PORT:47821} {
 	reverse_proxy bot:8080
 	encode gzip

@@ -18,7 +18,8 @@ services:
       API_DOMAIN: ${API_DOMAIN}
       API_HTTPS_PORT: ${API_HTTPS_PORT:-47821}
     ports:
-      - "80:80"  # только для получения и продления сертификата
+      # HTTP только для проверок Let's Encrypt: порт 80 занят nginx, он пересылает их сюда
+      - "127.0.0.1:8088:8088"
       - "${API_HTTPS_PORT:-47821}:${API_HTTPS_PORT:-47821}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
