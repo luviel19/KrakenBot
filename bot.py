@@ -950,10 +950,18 @@ class NewsAPI:
         if guild_id:
             guild = self.client.get_guild(int(guild_id)) if str(guild_id).isdecimal() else None
             return guild or error(404, "guild_not_found", "Бота нет на этом сервере")
-        configured = [g for g in self.client.guilds if staff_role_id(g.id)]
-        if len(configured) == 1:
-            return configured[0]
-        return error(400, "guild_required", "Бот на нескольких серверах — укажите guild_id")
+        # сервер сайта: API_GUILD_ID из .env, иначе тот, где в /setup выбран канал новостей,
+        # иначе единственный настроенный
+        if default_id := os.environ.get("API_GUILD_ID"):
+            return self.resolve_guild(default_id)
+        for candidates in (
+            [g for g in self.client.guilds if guild_config(g.id).get("news_channel_id")],
+            [g for g in self.client.guilds if staff_role_id(g.id)],
+        ):
+            if len(candidates) == 1:
+                return candidates[0]
+        return error(400, "guild_required",
+                     "Бот на нескольких серверах — задайте API_GUILD_ID в .env бота или передайте guild_id")
 
     def request_guild(self, request: web.Request, body: dict | None = None):
         # администратор сайта работает только со своим сервером
