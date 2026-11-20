@@ -13,5 +13,6 @@ COPY bot.py .
 RUN useradd --create-home --uid 1000 bot && mkdir -p /data && chown bot:bot /data
 USER bot
 VOLUME ["/data"]
+EXPOSE 8080
 
 CMD ["python", "bot.py"]

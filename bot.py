@@ -1,6 +1,8 @@
 """KrakenBot — бот тикетов для Discord-сервера разработчика игры."""
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -8,7 +10,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 import discord
+from aiohttp import web
 from discord import app_commands, ui
 
 # ---------------------------------------------------------------- настройки
@@ -23,6 +27,7 @@ TICKET_CHANNEL_ID = 1571844747327316069
 TICKET_CHANNEL_NAME = "тикеты"
 STAFF_CHANNEL_NAME = "функционал-бота"
 DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
+NEWS_KEEP = 100  # сколько последних новостей сервера хранить (для /news и API)
 TICKET_COOLDOWN = 120  # секунд между тикетами одного игрока (на роль поддержки не действует)
 
 GAME_NAME = "FISHING UNBOUND"
@@ -453,37 +458,43 @@ class PostModal(ui.Modal):
         for i, f in enumerate(files, 1):
             # вставленные из буфера картинки все называются image.png — attachment:// перепутал бы их
             f.filename = f"ref{i}{Path(f.filename).suffix.lower()}"
-        embeds = gallery_embeds(embed, [f.filename for f in files if is_image(f.filename)], channel.jump_url)
-
         mention_key = self.mention.component.values[0]
+
+        if not is_poll:
+            try:
+                item = await publish_news(
+                    channel, title=title, text=self.text.component.value, files=files, mention=mention_key,
+                    author={"id": str(interaction.user.id), "name": interaction.user.display_name,
+                            "avatar_url": interaction.user.display_avatar.url},
+                    source="discord",
+                )
+            except discord.Forbidden:
+                await interaction.followup.send(f"У бота нет прав писать в {channel.mention}.", ephemeral=True)
+                return
+            await interaction.followup.send(f"Новость опубликована: {item['url']}", ephemeral=True)
+            return
+
+        embeds = gallery_embeds(embed, [f"attachment://{f.filename}" for f in files if is_image(f.filename)],
+                                channel.jump_url)
         try:
             message = await channel.send(
                 content=MENTIONS[mention_key] if mention_key != "none" else None,
                 embeds=embeds,
                 files=files,
-                view=PollView() if is_poll else None,
+                view=PollView(),
                 allowed_mentions=discord.AllowedMentions(everyone=True),
             )
         except discord.Forbidden:
             await interaction.followup.send(f"У бота нет прав писать в {channel.mention}.", ephemeral=True)
             return
 
-        if is_poll:
-            await storage.set("polls", message.id, {
-                "title": title,
-                "channel_id": channel.id,
-                "author_id": interaction.user.id,
-                "ideas": 0,
-            })
-        else:
-            news = storage.get("news", interaction.guild.id) or []
-            news.insert(0, {"title": title, "text": self.text.component.value, "url": message.jump_url,
-                            "date": discord.utils.utcnow().isoformat()})
-            await storage.set("news", interaction.guild.id, news[:10])
-        await interaction.followup.send(
-            f"{'Опрос' if is_poll else 'Новость'} опубликован{'' if is_poll else 'а'}: {message.jump_url}",
-            ephemeral=True,
-        )
+        await storage.set("polls", message.id, {
+            "title": title,
+            "channel_id": channel.id,
+            "author_id": interaction.user.id,
+            "ideas": 0,
+        })
+        await interaction.followup.send(f"Опрос опубликован: {message.jump_url}", ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.exception("Ошибка при публикации поста", exc_info=error)
@@ -496,6 +507,7 @@ def is_image(filename: str) -> bool:
 
 
 def gallery_embeds(main: discord.Embed, images: list[str], base_url: str) -> list[discord.Embed]:
+    # images — ссылки на картинки: https://... или attachment://имя_файла
     """Картинки внутри поста сеткой: Discord склеивает до 4 эмбедов с одинаковым url в одну галерею."""
     embeds = [main]
     for start in range(0, len(images), 4):
@@ -507,7 +519,7 @@ def gallery_embeds(main: discord.Embed, images: list[str], base_url: str) -> lis
                 embed = discord.Embed(url=url, color=main.color)
                 embeds.append(embed)
             embed.url = url
-            embed.set_image(url=f"attachment://{filename}")
+            embed.set_image(url=filename)
     return embeds
 
 
@@ -621,6 +633,286 @@ class HubModal(ui.Modal, title="Панель сообщества"):
         )
 
 
+# ---------------------------------------------------------------- новости: Discord <-> сайт
+#
+# Новость может прийти из двух мест:
+#   • кнопка «Опубликовать новость» в Discord → бот отправляет её на сайт (вебхук SITE_WEBHOOK_URL);
+#   • сайт вызывает HTTP API бота (POST /api/news) → бот публикует её в Discord.
+# Изменения и удаления, сделанные через API, обратно на сайт не отправляются — сайт о них и так знает.
+# Формат запросов описан в API.md.
+
+
+def news_list(guild_id: int) -> list[dict]:
+    return storage.get("news", guild_id) or []
+
+
+def find_news(news_id: str) -> tuple[int, dict] | tuple[None, None]:
+    for guild_id, items in storage.data["news"].items():
+        for item in items:
+            if item.get("id") == news_id:
+                return int(guild_id), item
+    return None, None
+
+
+async def save_news(guild_id: int, items: list[dict]):
+    await storage.set("news", guild_id, items[:NEWS_KEEP])
+
+
+def news_embeds(guild: discord.Guild, channel: discord.TextChannel, *, title: str, text: str,
+                images: list[str], author: dict | None) -> list[discord.Embed]:
+    embed = discord.Embed(title=f"📰 {title}", description=text, color=discord.Color.gold(),
+                          timestamp=discord.utils.utcnow())
+    if author:
+        embed.set_author(name=author.get("name") or "Команда", icon_url=author.get("avatar_url"))
+    embed.set_footer(text=f"Новости {game_name(guild.id)}")
+    return gallery_embeds(embed, images, channel.jump_url)
+
+
+async def publish_news(channel: discord.TextChannel, *, title: str, text: str, files=(), image_urls=(),
+                       mention: str = "none", author: dict | None = None, source: str,
+                       external_id: str | None = None) -> dict:
+    """Публикует новость в канал, сохраняет её и (если она из Discord) отправляет на сайт."""
+    guild = channel.guild
+    images = [f"attachment://{f.filename}" for f in files if is_image(f.filename)] + list(image_urls)
+    message = await channel.send(
+        content=MENTIONS[mention] if mention != "none" else None,
+        embeds=news_embeds(guild, channel, title=title, text=text, images=images[:10], author=author),
+        files=list(files),
+        allowed_mentions=discord.AllowedMentions(everyone=True),
+    )
+    now = discord.utils.utcnow().isoformat()
+    item = {
+        "id": str(message.id),
+        "external_id": external_id,
+        "source": source,
+        "guild_id": str(guild.id),
+        "channel_id": str(channel.id),
+        "title": title,
+        "text": text,
+        # ссылки на вложения Discord со временем протухают — сайту стоит скачивать картинки к себе
+        "images": [a.url for a in message.attachments if is_image(a.filename)] + list(image_urls),
+        "author": author,
+        "url": message.jump_url,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await save_news(guild.id, [item] + news_list(guild.id))
+    if source == "discord":
+        notify_site("news.created", item)
+    return item
+
+
+def notify_site(event: str, item: dict):
+    """Отправляет событие на сайт в фоне, не задерживая ответ в Discord."""
+    if os.environ.get("SITE_WEBHOOK_URL"):
+        asyncio.create_task(_deliver_webhook(event, item))
+
+
+async def _deliver_webhook(event: str, item: dict):
+    url = os.environ["SITE_WEBHOOK_URL"]
+    body = json.dumps({"event": event, "data": item}, ensure_ascii=False).encode()
+    headers = {"Content-Type": "application/json", "X-Kraken-Event": event}
+    if secret := os.environ.get("SITE_WEBHOOK_SECRET"):
+        headers["X-Kraken-Signature"] = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+    for attempt, delay in enumerate((0, 5, 30, 120), 1):
+        await asyncio.sleep(delay)
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+                async with session.post(url, data=body, headers=headers) as response:
+                    if response.status < 300:
+                        log.info("Сайт: %s %s доставлено", event, item.get("id"))
+                        return
+                    log.warning("Сайт: %s — ответ %s (попытка %s)", event, response.status, attempt)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            log.warning("Сайт: %s — %s (попытка %s)", event, error, attempt)
+    log.error("Сайт: не удалось доставить %s %s", event, item.get("id"))
+
+
+class NewsAPI:
+    """HTTP API для сайта. Запускается, только если задан API_TOKEN."""
+
+    def __init__(self, client: discord.Client, token: str):
+        self.client = client
+        self.token = token
+        self.app = web.Application(middlewares=[self.auth], client_max_size=1024 ** 2)
+        self.app.add_routes([
+            web.get("/api/health", self.health),
+            web.get("/api/news", self.list_news),
+            web.post("/api/news", self.create_news),
+            web.get("/api/news/{id}", self.get_news),
+            web.patch("/api/news/{id}", self.update_news),
+            web.delete("/api/news/{id}", self.delete_news),
+        ])
+
+    async def start(self, port: int):
+        runner = web.AppRunner(self.app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        log.info("API новостей слушает порт %s", port)
+
+    @web.middleware
+    async def auth(self, request: web.Request, handler):
+        if request.path != "/api/health":
+            header = request.headers.get("Authorization", "")
+            if not hmac.compare_digest(header.encode(), f"Bearer {self.token}".encode()):
+                return error(401, "unauthorized", "Нужен заголовок Authorization: Bearer <API_TOKEN>")
+        try:
+            return await handler(request)
+        except web.HTTPException:
+            raise
+        except discord.Forbidden:
+            return error(403, "discord_forbidden", "У бота нет прав в этом канале")
+        except Exception:
+            log.exception("API: ошибка в %s %s", request.method, request.path)
+            return error(500, "internal_error", "Внутренняя ошибка бота")
+
+    async def health(self, request: web.Request):
+        return web.json_response({"ok": self.client.is_ready()})
+
+    def resolve_guild(self, guild_id) -> discord.Guild | web.Response:
+        if guild_id:
+            guild = self.client.get_guild(int(guild_id)) if str(guild_id).isdecimal() else None
+            return guild or error(404, "guild_not_found", "Бота нет на этом сервере")
+        configured = [g for g in self.client.guilds if staff_role_id(g.id)]
+        if len(configured) == 1:
+            return configured[0]
+        return error(400, "guild_required", "Бот на нескольких серверах — укажите guild_id")
+
+    async def list_news(self, request: web.Request):
+        guild = self.resolve_guild(request.query.get("guild_id"))
+        if isinstance(guild, web.Response):
+            return guild
+        try:
+            limit = min(max(int(request.query.get("limit", 20)), 1), NEWS_KEEP)
+            offset = max(int(request.query.get("offset", 0)), 0)
+        except ValueError:
+            return error(400, "bad_query", "limit и offset должны быть числами")
+        items = [i for i in news_list(guild.id) if i.get("id")]
+        return web.json_response({"items": items[offset:offset + limit], "total": len(items)})
+
+    async def get_news(self, request: web.Request):
+        _, item = find_news(request.match_info["id"])
+        return web.json_response(item) if item else error(404, "not_found", "Новость не найдена")
+
+    async def create_news(self, request: web.Request):
+        body = await read_json(request)
+        if isinstance(body, web.Response):
+            return body
+        guild = self.resolve_guild(body.get("guild_id"))
+        if isinstance(guild, web.Response):
+            return guild
+
+        problem = validate_news(body, partial=False)
+        if problem:
+            return error(422, "validation_error", problem)
+
+        channel_id = body.get("channel_id") or guild_config(guild.id).get("news_channel_id")
+        channel = guild.get_channel(int(channel_id)) if str(channel_id or "").isdecimal() else None
+        if not isinstance(channel, discord.TextChannel):
+            return error(409, "news_channel_not_set",
+                         "Канал новостей не выбран: укажите channel_id или выберите канал в /setup")
+
+        if body.get("external_id"):
+            existing = next((i for i in news_list(guild.id) if i.get("external_id") == str(body["external_id"])), None)
+            if existing:  # повторный запрос с тем же external_id не создаёт дубль
+                return web.json_response(existing, status=200)
+
+        item = await publish_news(
+            channel,
+            title=body["title"].strip(),
+            text=body["text"].strip(),
+            image_urls=body.get("images") or [],
+            mention=body.get("mention", "none"),
+            author=body.get("author"),
+            source="site",
+            external_id=str(body["external_id"]) if body.get("external_id") else None,
+        )
+        return web.json_response(item, status=201)
+
+    async def update_news(self, request: web.Request):
+        guild_id, item = find_news(request.match_info["id"])
+        if not item:
+            return error(404, "not_found", "Новость не найдена")
+        body = await read_json(request)
+        if isinstance(body, web.Response):
+            return body
+        problem = validate_news(body, partial=True)
+        if problem:
+            return error(422, "validation_error", problem)
+
+        guild = self.client.get_guild(guild_id)
+        channel = guild and guild.get_channel(int(item["channel_id"]))
+        if channel is None:
+            return error(410, "gone", "Канал новости удалён")
+        try:
+            message = await channel.fetch_message(int(item["id"]))
+        except discord.NotFound:
+            return error(410, "gone", "Сообщение новости удалено в Discord")
+
+        item["title"] = body.get("title", item["title"]).strip()
+        item["text"] = body.get("text", item["text"]).strip()
+        embeds = message.embeds
+        embeds[0].title = f"📰 {item['title']}"
+        embeds[0].description = item["text"]
+        await message.edit(embeds=embeds)
+
+        item["updated_at"] = discord.utils.utcnow().isoformat()
+        await save_news(guild_id, news_list(guild_id))
+        return web.json_response(item)
+
+    async def delete_news(self, request: web.Request):
+        guild_id, item = find_news(request.match_info["id"])
+        if not item:
+            return error(404, "not_found", "Новость не найдена")
+        # сначала убираем из хранилища, чтобы on_raw_message_delete не отправил удаление обратно на сайт
+        await save_news(guild_id, [i for i in news_list(guild_id) if i is not item])
+        guild = self.client.get_guild(guild_id)
+        channel = guild and guild.get_channel(int(item["channel_id"]))
+        if channel is not None:
+            try:
+                await channel.get_partial_message(int(item["id"])).delete()
+            except discord.NotFound:
+                pass
+        return web.Response(status=204)
+
+
+def error(status: int, code: str, message: str) -> web.Response:
+    return web.json_response({"error": code, "message": message}, status=status)
+
+
+async def read_json(request: web.Request) -> dict | web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return error(400, "bad_json", "Тело запроса должно быть JSON")
+    return body if isinstance(body, dict) else error(400, "bad_json", "Ожидается JSON-объект")
+
+
+def validate_news(body: dict, *, partial: bool) -> str | None:
+    for field, limit in (("title", 250), ("text", 4000)):
+        if field not in body and partial:
+            continue
+        value = body.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return f"Поле {field} обязательно и должно быть непустой строкой"
+        if len(value) > limit:
+            return f"Поле {field} длиннее {limit} символов"
+    if partial:
+        return None
+    images = body.get("images", [])
+    if not isinstance(images, list) or len(images) > 10 or not all(
+        isinstance(u, str) and u.startswith(("https://", "http://")) for u in images
+    ):
+        return "images — список до 10 ссылок http(s)"
+    if body.get("mention", "none") not in MENTIONS:
+        return "mention — одно из: none, everyone, here"
+    author = body.get("author")
+    if author is not None and not (isinstance(author, dict) and isinstance(author.get("name", ""), str)):
+        return "author — объект вида {\"name\": \"...\", \"avatar_url\": \"...\"}"
+    return None
+
+
 # ---------------------------------------------------------------- центр сообщества
 
 
@@ -653,7 +945,7 @@ def news_embed(guild_id: int) -> discord.Embed:
         embed.description = "Официальных публикаций пока нет. Загляните позже!"
     for item in news[:4]:
         text = item["text"] if len(item["text"]) <= 300 else item["text"][:300].rstrip() + "…"
-        date = discord.utils.format_dt(datetime.fromisoformat(item["date"]), "d")
+        date = discord.utils.format_dt(datetime.fromisoformat(item.get("created_at") or item["date"]), "d")
         embed.add_field(name=item["title"][:256], value=f"{text}\n{date} · [Читать]({item['url']})", inline=False)
     return embed
 
@@ -703,6 +995,7 @@ class HubView(ui.View):
 # id сервера зашит в custom_id, так что кнопки работают и после перезапуска бота.
 
 NEW_CHANNEL = "new"
+NO_CHANNEL = "none"
 
 
 def setup_draft(guild: discord.Guild) -> dict:
@@ -714,6 +1007,7 @@ def setup_draft(guild: discord.Guild) -> dict:
             "staff_role_id": cfg.get("staff_role_id"),
             "ticket_channel": cfg.get("ticket_channel_id") or NEW_CHANNEL,
             "staff_channel": cfg.get("staff_channel_id") or NEW_CHANNEL,
+            "news_channel": cfg.get("news_channel_id") or NO_CHANNEL,
             "game_name": cfg.get("game_name"),
             "game_info": cfg.get("game_info"),
             "hub_greeting": cfg.get("hub_greeting"),
@@ -723,6 +1017,8 @@ def setup_draft(guild: discord.Guild) -> dict:
 
 def setup_embed(guild: discord.Guild, draft: dict, note: str | None = None) -> discord.Embed:
     def channel_text(value, default_name):
+        if value == NO_CHANNEL:
+            return "не выбран"
         if value == NEW_CHANNEL:
             return f"➕ будет создан **#{default_name}**"
         channel = guild.get_channel(value)
@@ -756,7 +1052,13 @@ def setup_embed(guild: discord.Guild, draft: dict, note: str | None = None) -> d
         inline=False,
     )
     embed.add_field(
-        name="4. Игра",
+        name="4. Канал новостей",
+        value=channel_text(draft.get("news_channel", NO_CHANNEL), "")
+        + "\nКуда публикуются новости с сайта (через API). Можно не выбирать",
+        inline=False,
+    )
+    embed.add_field(
+        name="5. Игра",
         value=f"**{draft['game_name'] or DEFAULT_GAME_NAME}** — кнопка «✏️ Игра», чтобы изменить название и описание",
         inline=False,
     )
@@ -773,6 +1075,7 @@ def setup_view(guild: discord.Guild, draft: dict) -> ui.View:
     view.add_item(SetupSelect(guild, "role", draft))
     view.add_item(SetupSelect(guild, "tickets", draft))
     view.add_item(SetupSelect(guild, "staff", draft))
+    view.add_item(SetupSelect(guild, "news", draft))
     view.add_item(SetupButton(guild.id, "save"))
     view.add_item(SetupButton(guild.id, "game"))
     return view
@@ -800,7 +1103,10 @@ async def check_setup_access(interaction: discord.Interaction, guild: discord.Gu
     return True
 
 
-class SetupSelect(ui.DynamicItem[ui.Select], template=r"setup:(?P<field>role|tickets|staff):(?P<gid>\d+)"):
+CHANNEL_FIELDS = {"tickets": "ticket_channel", "staff": "staff_channel", "news": "news_channel"}
+
+
+class SetupSelect(ui.DynamicItem[ui.Select], template=r"setup:(?P<field>role|tickets|staff|news):(?P<gid>\d+)"):
     def __init__(self, guild: discord.Guild, field: str, draft: dict | None = None):
         self.guild = guild
         self.field = field
@@ -813,21 +1119,25 @@ class SetupSelect(ui.DynamicItem[ui.Select], template=r"setup:(?P<field>role|tic
             ] or [discord.SelectOption(label="На сервере нет ролей — создайте роль и откройте /setup", value="0")]
             placeholder = "1. Роль поддержки"
         else:
-            key = "ticket_channel" if field == "tickets" else "staff_channel"
-            name = TICKET_CHANNEL_NAME if field == "tickets" else STAFF_CHANNEL_NAME
+            key = CHANNEL_FIELDS[field]
             channels = sorted(guild.text_channels, key=lambda c: c.position)[:24]
-            options = [discord.SelectOption(label=f"➕ Создать новый #{name}", value=NEW_CHANNEL,
-                                            default=draft[key] == NEW_CHANNEL)]
+            if field == "news":
+                options = [discord.SelectOption(label="🚫 Не выбран", value=NO_CHANNEL,
+                                                default=draft.get(key, NO_CHANNEL) == NO_CHANNEL)]
+            else:
+                name = TICKET_CHANNEL_NAME if field == "tickets" else STAFF_CHANNEL_NAME
+                options = [discord.SelectOption(label=f"➕ Создать новый #{name}", value=NEW_CHANNEL,
+                                                default=draft[key] == NEW_CHANNEL)]
             options += [
                 discord.SelectOption(
                     label=f"#{c.name}"[:100],
                     value=str(c.id),
                     description=(c.category.name if c.category else None),
-                    default=c.id == draft[key],
+                    default=c.id == draft.get(key),
                 )
                 for c in channels
             ]
-            placeholder = "2. Канал тикетов" if field == "tickets" else "3. Канал команды"
+            placeholder = {"tickets": "2. Канал тикетов", "staff": "3. Канал команды", "news": "4. Канал новостей"}[field]
         super().__init__(ui.Select(custom_id=f"setup:{field}:{guild.id}", placeholder=placeholder, options=options))
 
     @classmethod
@@ -846,8 +1156,7 @@ class SetupSelect(ui.DynamicItem[ui.Select], template=r"setup:(?P<field>role|tic
         if self.field == "role":
             draft["staff_role_id"] = int(value) or None
         else:
-            key = "ticket_channel" if self.field == "tickets" else "staff_channel"
-            draft[key] = value if value == NEW_CHANNEL else int(value)
+            draft[CHANNEL_FIELDS[self.field]] = value if value in (NEW_CHANNEL, NO_CHANNEL) else int(value)
         await storage.set("setup_drafts", self.guild.id, draft)
         await interaction.response.edit_message(embed=setup_embed(self.guild, draft), view=setup_view(self.guild, draft))
 
@@ -890,6 +1199,7 @@ class SetupButton(ui.DynamicItem[ui.Button], template=r"setup:(?P<action>save|ga
             "staff_role_id": draft["staff_role_id"],
             "ticket_channel_id": None if draft["ticket_channel"] == NEW_CHANNEL else draft["ticket_channel"],
             "staff_channel_id": None if draft["staff_channel"] == NEW_CHANNEL else draft["staff_channel"],
+            "news_channel_id": None if draft.get("news_channel", NO_CHANNEL) == NO_CHANNEL else draft["news_channel"],
             "game_name": draft["game_name"],
             "game_info": draft["game_info"],
             "hub_greeting": draft["hub_greeting"],
@@ -1007,6 +1317,21 @@ class KrakenBot(discord.Client):
         self.add_view(StaffPanelView())
         self.add_view(HubView())
         self.add_dynamic_items(SetupSelect, SetupButton)
+
+        if token := os.environ.get("API_TOKEN"):
+            await NewsAPI(self, token).start(int(os.environ.get("API_PORT", 8080)))
+        else:
+            log.info("API_TOKEN не задан — API новостей выключено")
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent):
+        # новость удалили прямо в Discord — убираем её и сообщаем сайту
+        if payload.guild_id is None:
+            return
+        items = news_list(payload.guild_id)
+        item = next((i for i in items if i.get("id") == str(payload.message_id)), None)
+        if item:
+            await save_news(payload.guild_id, [i for i in items if i is not item])
+            notify_site("news.deleted", item)
 
     def add_player_commands(self):
         @self.tree.command(name="info", description="Информация об игре")
