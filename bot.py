@@ -237,9 +237,22 @@ def perm_roles(guild_id: int, perm: str) -> list[int]:
     return permissions(guild_id)[perm]
 
 
+def permission_users(guild_id: int) -> dict[str, list[int]]:
+    """Отдельные участники, которым право выдано лично (помимо ролей)."""
+    users = guild_config(guild_id).get("permission_users", {})
+    return {key: users.get(key, []) for key in PERMISSIONS}
+
+
+def perm_users(guild_id: int, perm: str) -> list[int]:
+    return permission_users(guild_id)[perm]
+
+
+def holders_mention(roles: list[int], users: list[int]) -> str:
+    return ", ".join([f"<@&{r}>" for r in roles] + [f"<@{u}>" for u in users])
+
+
 def roles_mention(guild_id: int, perm: str) -> str:
-    roles = perm_roles(guild_id, perm)
-    return ", ".join(f"<@&{r}>" for r in roles) if roles else "администрация сервера"
+    return holders_mention(perm_roles(guild_id, perm), perm_users(guild_id, perm)) or "администрация сервера"
 
 
 def ticket_settings(guild_id: int) -> dict:
@@ -253,12 +266,12 @@ def is_admin(member: discord.Member) -> bool:
 def has_perm(member: discord.abc.User | None, perm: str) -> bool:
     if not isinstance(member, discord.Member):
         return False
-    roles = perm_roles(member.guild.id, perm)
-    if perm == "create_tickets" and not roles:
+    roles, users = perm_roles(member.guild.id, perm), perm_users(member.guild.id, perm)
+    if perm == "create_tickets" and not roles and not users:
         return True
     if is_admin(member) or (perm == "setup" and member.guild_permissions.manage_guild):
         return True
-    return any(member.get_role(r) for r in roles)
+    return member.id in users or any(member.get_role(r) for r in roles)
 
 
 def no_access(guild_id: int, perm: str) -> str:
@@ -384,10 +397,10 @@ async def create_ticket(interaction: discord.Interaction, *, category_key, subje
         poll_message=poll_message,
     )
     ping = ticket_settings(interaction.guild.id)["ping"]
-    roles = perm_roles(interaction.guild.id, "ticket_ping")
     mention = ""
     if ping == "all" or (ping == "critical" and category_key == "critical"):
-        mention = " ".join(f"<@&{r}>" for r in roles)
+        mention = holders_mention(perm_roles(interaction.guild.id, "ticket_ping"),
+                                  perm_users(interaction.guild.id, "ticket_ping")).replace(",", "")
     await thread.send(
         content=f"{interaction.user.mention} создал тикет. {mention}".strip(),
         embed=embed,
@@ -1563,6 +1576,8 @@ DM_LIMIT = 25
 def setup_draft(guild: discord.Guild) -> dict:
     """Черновик настроек: то, что выбрано в мастере, поверх текущих настроек сервера."""
     draft = storage.get("setup_drafts", guild.id)
+    if draft is not None and "permissions" in draft and "users" not in draft:
+        draft["users"] = permission_users(guild.id)  # черновик до появления выбора участников
     if draft is None or "permissions" not in draft:  # черновик старого мастера начинаем заново
         cfg = guild_config(guild.id)
         draft = {
@@ -1570,6 +1585,7 @@ def setup_draft(guild: discord.Guild) -> dict:
             "perm": "tickets",
             "channel": "ticket",
             "permissions": permissions(guild.id),
+            "users": permission_users(guild.id),
             "channels": {
                 key: cfg.get(f"{key}_channel_id") or (NO_CHANNEL if spec["optional"] else NEW_CHANNEL)
                 for key, spec in CHANNELS.items()
@@ -1596,9 +1612,11 @@ def role_names(guild: discord.Guild, ids: list[int], empty: str = "—") -> str:
     return ", ".join(names) if names else empty
 
 
-def perm_roles_text(guild: discord.Guild, perm: str, ids: list[int]) -> str:
+def perm_roles_text(guild: discord.Guild, perm: str, draft: dict) -> str:
     empty = {"create_tickets": "все участники", "setup": "только «Управлять сервером»"}.get(perm, "—")
-    return role_names(guild, ids, empty)
+    names = [f"@{role.name}" for role in map(guild.get_role, draft["permissions"][perm]) if role]
+    names += [f"<@{u}>" for u in draft["users"][perm]]  # участники — упоминанием: имя покажет Discord
+    return ", ".join(names) if names else empty
 
 
 def channel_text(guild: discord.Guild, key: str, value) -> str:
@@ -1655,16 +1673,18 @@ def setup_embed(guild: discord.Guild, draft: dict, note: str | None = None, dm: 
         embed.title = "🛡️ Права — кто что может"
         embed.description = (
             "1. В первом списке выберите право.\n"
-            "2. Во втором отметьте роли — можно несколько; снимите все, чтобы забрать право.\n"
+            "2. Во втором отметьте роли и/или отдельных участников — можно несколько; "
+            "снимите всех, чтобы забрать право.\n"
             "Администраторы и владелец сервера могут всё: Discord не даёт скрыть от них каналы."
         )
         for key, (label, emoji, why) in PERMISSIONS.items():
             marker = "▶️ " if key == draft["perm"] else ""
-            roles = perm_roles_text(guild, key, draft["permissions"][key])
+            roles = perm_roles_text(guild, key, draft)
             embed.add_field(name=f"{marker}{emoji} {label}", value=f"**{roles}**\n{why}"[:1024], inline=False)
-        if dm and len(guild.roles) - 1 > DM_LIMIT:
-            embed.set_footer(text=f"В личных сообщениях видны только {DM_LIMIT} верхних ролей. "
-                                  "Остальные выберите через /setup на сервере.")
+        if dm:
+            limit = f" и только {DM_LIMIT} верхних ролей" if len(guild.roles) - 1 > DM_LIMIT else ""
+            embed.set_footer(text=f"В личных сообщениях Discord не показывает участников сервера{limit}. "
+                                  "Отдельных участников выберите через /setup на сервере.")
     elif page == "channels":
         embed.title = "📁 Каналы — где работает бот"
         embed.description = (
@@ -1698,7 +1718,7 @@ def setup_embed(guild: discord.Guild, draft: dict, note: str | None = None, dm: 
             "Потом их можно поменять командой `/setup` на сервере."
         )
         embed.add_field(name="🛡️ Права", inline=False, value="\n".join(
-            f"{emoji} {label}: **{perm_roles_text(guild, key, draft['permissions'][key])}**"
+            f"{emoji} {label}: **{perm_roles_text(guild, key, draft)}**"
             for key, (label, emoji, _) in PERMISSIONS.items()
         )[:1024])
         embed.add_field(name="📁 Каналы", inline=False, value="\n".join(
@@ -1754,10 +1774,12 @@ def setup_view(guild: discord.Guild, draft: dict, dm: bool = False) -> ui.View:
             select("roles", ui.Select(placeholder=f"Роли: {label}", options=options, min_values=0,
                                       max_values=len(options)), 1)
         else:
-            select("roles", ui.RoleSelect(placeholder=f"Роли: {label}", min_values=0, max_values=25,
-                                          default_values=[discord.Object(r) for r in chosen if guild.get_role(r)]), 1)
+            defaults = [discord.Object(r, type=discord.Role) for r in chosen if guild.get_role(r)]
+            defaults += [discord.Object(u, type=discord.User) for u in draft["users"][perm]]
+            select("roles", ui.MentionableSelect(placeholder=f"Роли и участники: {label}", min_values=0,
+                                                 max_values=25, default_values=defaults[:25]), 1)
         nav(2)
-        button("copy", "Эти роли — на все командные права", "📋", row=2)
+        button("copy", "Выбранных — на все командные права", "📋", row=2)
         save(2)
     elif page == "channels":
         key = draft["channel"]
@@ -1866,13 +1888,16 @@ class SetupSelect(ui.DynamicItem[ui.Item], template=r"setup:s:(?P<field>[a-z_]+)
 
         if field == "perm":
             draft["perm"] = values[0]
-        elif field == "roles":
+        elif field == "roles" and interaction.guild is None:
+            # в ЛС список только из ролей, и не всех: невидимые роли и участников сохраняем
             chosen = [int(v) for v in values if v != "0"]
-            if interaction.guild is None:
-                # в ЛС видны не все роли — выбранные раньше, но не показанные, сохраняем
-                shown = {r.id for r in dm_roles(guild)}
-                chosen += [r for r in draft["permissions"][draft["perm"]] if r not in shown]
+            shown = {r.id for r in dm_roles(guild)}
+            chosen += [r for r in draft["permissions"][draft["perm"]] if r not in shown]
             draft["permissions"][draft["perm"]] = chosen
+        elif field == "roles":
+            picked = self.item.values
+            draft["permissions"][draft["perm"]] = [v.id for v in picked if isinstance(v, discord.Role)]
+            draft["users"][draft["perm"]] = [v.id for v in picked if not isinstance(v, discord.Role)]
         elif field == "channel":
             draft["channel"] = values[0]
         elif field == "target":
@@ -1915,11 +1940,13 @@ class SetupButton(ui.DynamicItem[ui.Button], template=r"setup:b:(?P<action>[a-z_
         if action in ("main", "perms", "channels", "tickets"):
             draft["page"] = action
         elif action == "copy":
-            roles = draft["permissions"][draft["perm"]]
+            source = draft["perm"]
+            who = perm_roles_text(guild, source, draft)
             for key in TEAM_PERMISSIONS:
-                draft["permissions"][key] = list(roles)
+                draft["permissions"][key] = list(draft["permissions"][source])
+                draft["users"][key] = list(draft["users"][source])
             names = ", ".join(PERMISSIONS[k][0] for k in TEAM_PERMISSIONS)
-            note = f"📋 Роли **{role_names(guild, roles)}** назначены на: {names}."
+            note = f"📋 **{who}** — назначены на: {names}."
         elif action == "new":
             draft["channels"][draft["channel"]] = NEW_CHANNEL
         elif action == "none":
@@ -1931,8 +1958,8 @@ class SetupButton(ui.DynamicItem[ui.Button], template=r"setup:b:(?P<action>[a-z_
 
 async def save_setup(interaction: discord.Interaction, guild: discord.Guild, draft: dict):
     problems = []
-    if not any(guild.get_role(r) for r in draft["permissions"]["tickets"]):
-        problems.append("❗ Выберите хотя бы одну роль для права **🎫 Работа с тикетами** (🛡️ Права) — "
+    if not any(guild.get_role(r) for r in draft["permissions"]["tickets"]) and not draft["users"]["tickets"]:
+        problems.append("❗ Выберите хотя бы одну роль или участника для права **🎫 Работа с тикетами** (🛡️ Права) — "
                         "иначе тикеты увидят только администраторы.")
     for key, spec in CHANNELS.items():
         value = draft["channels"][key]
@@ -1947,6 +1974,7 @@ async def save_setup(interaction: discord.Interaction, guild: discord.Guild, dra
     config.pop("staff_role_id", None)  # заменена правами
     config.update({
         "permissions": draft["permissions"],
+        "permission_users": draft["users"],
         "tickets": draft["tickets"],
         "game_name": draft["game_name"],
         "game_info": draft["game_info"],
@@ -2212,7 +2240,7 @@ class KrakenBot(discord.Client):
         return None
 
     async def ensure_ticket_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        creators = roles_of(guild, "create_tickets")
+        creators = holders_of(guild, "create_tickets")
         public = not creators
         wanted = {
             # канал и кнопку видят все (или только роли «Создание тикетов»), но не пишут в него и не создают ветки
@@ -2239,7 +2267,7 @@ class KrakenBot(discord.Client):
         for role in creators:
             wanted[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True,
                                                        send_messages_in_threads=True)
-        for role in roles_of(guild, "tickets"):
+        for role in holders_of(guild, "tickets"):
             # «Управлять ветками» даёт роли доступ ко всем приватным веткам-тикетам
             wanted[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True,
                                                        send_messages_in_threads=True, manage_threads=True)
@@ -2253,7 +2281,7 @@ class KrakenBot(discord.Client):
                 view_channel=True, send_messages=True, embed_links=True, read_message_history=True
             ),
         }
-        for role in roles_of(guild, *PANEL_PERMISSIONS):
+        for role in holders_of(guild, *PANEL_PERMISSIONS):
             wanted[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
         return await managed_channel(guild, "staff", wanted, topic="Функционал бота для команды")
 
@@ -2266,7 +2294,7 @@ class KrakenBot(discord.Client):
                 view_channel=True, send_messages=True, embed_links=True, read_message_history=True
             ),
         }
-        for role in roles_of(guild, "logs"):
+        for role in holders_of(guild, "logs"):
             wanted[role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True,
                                                        send_messages=False)
         await managed_channel(guild, "log", wanted, topic="Журнал действий KrakenBot")
@@ -2318,9 +2346,13 @@ class KrakenBot(discord.Client):
         await upsert_panel(channel, "panels", "ticket:create", embed, PanelView())
 
 
-def roles_of(guild: discord.Guild, *perms: str) -> list[discord.Role]:
-    ids = dict.fromkeys(r for perm in perms for r in perm_roles(guild.id, perm))
-    return [role for role in map(guild.get_role, ids) if role]
+def holders_of(guild: discord.Guild, *perms: str) -> list[discord.Role | discord.Object]:
+    """Роли и отдельные участники с любым из прав — цели для прав канала."""
+    role_ids = dict.fromkeys(r for perm in perms for r in perm_roles(guild.id, perm))
+    user_ids = dict.fromkeys(u for perm in perms for u in perm_users(guild.id, perm))
+    # участника можно указать без кэша (у бота нет доступа к списку участников) — достаточно id
+    return ([role for role in map(guild.get_role, role_ids) if role]
+            + [discord.Object(u, type=discord.Member) for u in user_ids])
 
 
 async def managed_channel(guild: discord.Guild, key: str, wanted: dict, *, topic: str) -> discord.TextChannel:
@@ -2335,11 +2367,12 @@ async def managed_channel(guild: discord.Guild, key: str, wanted: dict, *, topic
         config[f"{key}_channel_id"] = channel.id
         log.info("Сервер %s: создан канал #%s", guild, channel.name)
     else:
-        overwrites = {target: ow for target, ow in channel.overwrites.items()
-                      if target.id not in managed or target in wanted}
-        overwrites.update(wanted)
-        if overwrites != channel.overwrites:
-            await channel.edit(overwrites=overwrites, reason=f"Права: {spec['label']}")
+        # сравниваем по id: участник может быть и Member, и Object
+        merged = {target.id: (target, ow) for target, ow in channel.overwrites.items() if target.id not in managed}
+        merged.update({target.id: (target, ow) for target, ow in wanted.items()})
+        current = {target.id: ow for target, ow in channel.overwrites.items()}
+        if {tid: ow for tid, (_, ow) in merged.items()} != current:
+            await channel.edit(overwrites=dict(merged.values()), reason=f"Права: {spec['label']}")
     config.setdefault("managed_overwrites", {})[key] = [target.id for target in wanted]
     await storage.set("config", guild.id, config)
     return channel
