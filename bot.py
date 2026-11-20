@@ -6,6 +6,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +29,9 @@ TICKET_CHANNEL_ID = 1571844747327316069
 TICKET_CHANNEL_NAME = "тикеты"
 STAFF_CHANNEL_NAME = "функционал-бота"
 DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
-NEWS_KEEP = 100  # сколько последних новостей сервера хранить (для /news и API)
+NEWS_KEEP = 1000  # сколько последних новостей сервера хранить (для /news и API)
+SESSION_TTL = 3600  # срок жизни входа на сайт, секунд
+DUPLICATE_WINDOW = 600  # одинаковая новость с сайта в течение 10 минут считается повтором
 TICKET_COOLDOWN = 120  # секунд между тикетами одного игрока (на роль поддержки не действует)
 
 GAME_NAME = "FISHING UNBOUND"
@@ -94,7 +98,7 @@ class Storage:
         self.lock = asyncio.Lock()
         self.data = {
             "counters": {}, "panels": {}, "staff_panels": {}, "tickets": {}, "polls": {},
-            "news": {}, "progress": {}, "config": {}, "setup_drafts": {},
+            "news": {}, "progress": {}, "config": {}, "setup_drafts": {}, "site_users": {}, "sessions": {},
         }
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -589,6 +593,18 @@ class StaffPanelView(ui.View):
     async def hub(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(HubModal())
 
+    @ui.button(label="Доступ к сайту", emoji="🔑", style=discord.ButtonStyle.secondary, custom_id="staff:site")
+    async def site(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        username, password = await create_site_access(interaction.user)
+        await interaction.followup.send(
+            "🔑 **Доступ к админке сайта**\n"
+            f"Логин: `{username}`\nПароль: ||`{password}`||\n\n"
+            "Пароль показывается один раз — сохраните его. Повторное нажатие выдаст новый пароль, "
+            "старый перестанет работать. Если у вас заберут роль поддержки, вход на сайт закроется сам.",
+            ephemeral=True,
+        )
+
 
 class ProgressModal(ui.Modal, title="Ход разработки"):
     text = ui.Label(
@@ -670,7 +686,7 @@ def news_embeds(guild: discord.Guild, channel: discord.TextChannel, *, title: st
 
 async def publish_news(channel: discord.TextChannel, *, title: str, text: str, files=(), image_urls=(),
                        mention: str = "none", author: dict | None = None, source: str,
-                       external_id: str | None = None) -> dict:
+                       external_id: str | None = None, date: str | None = None) -> dict:
     """Публикует новость в канал, сохраняет её и (если она из Discord) отправляет на сайт."""
     guild = channel.guild
     images = [f"attachment://{f.filename}" for f in files if is_image(f.filename)] + list(image_urls)
@@ -693,6 +709,7 @@ async def publish_news(channel: discord.TextChannel, *, title: str, text: str, f
         "images": [a.url for a in message.attachments if is_image(a.filename)] + list(image_urls),
         "author": author,
         "url": message.jump_url,
+        "date": date or now[:10],
         "created_at": now,
         "updated_at": now,
     }
@@ -729,15 +746,74 @@ async def _deliver_webhook(event: str, item: dict):
     log.error("Сайт: не удалось доставить %s %s", event, item.get("id"))
 
 
+def public_news(item: dict) -> dict:
+    """Новость в формате сайта: {id, date, title, body} + дополнительные поля."""
+    author = item.get("author") or {}
+    return {
+        "id": item["id"],
+        "date": (item.get("date") or item.get("created_at") or "")[:10],
+        "title": item["title"],
+        "body": item["text"],
+        "images": item.get("images") or [],
+        "url": item.get("url"),
+        "source": item.get("source"),
+        "author": author.get("name"),
+        "external_id": item.get("external_id"),
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+    }
+
+
+def hash_password(password: str, salt: bytes) -> str:
+    return hashlib.scrypt(password.encode(), salt=salt, n=2 ** 14, r=8, p=1).hex()
+
+
+def token_key(token: str) -> str:
+    # в хранилище лежат только хэши токенов
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def create_site_access(member: discord.Member) -> tuple[str, str]:
+    """Выдаёт (или перевыпускает) логин и пароль для админки сайта. Старые входы этого логина сбрасываются."""
+    username = re.sub(r"[^a-z0-9_.]", "", member.name.lower()) or f"user{member.id}"
+    password = secrets.token_urlsafe(12)
+    salt = secrets.token_bytes(16)
+    await storage.set("site_users", username, {
+        "discord_id": str(member.id),
+        "guild_id": str(member.guild.id),
+        "salt": salt.hex(),
+        "hash": await asyncio.to_thread(hash_password, password, salt),
+        "created_at": discord.utils.utcnow().isoformat(),
+    })
+    for key, session in list(storage.data["sessions"].items()):
+        if session["username"] == username:
+            await storage.pop("sessions", key)
+    return username, password
+
+
 class NewsAPI:
-    """HTTP API для сайта. Запускается, только если задан API_TOKEN."""
+    """HTTP API для сайта. Запускается, только если задан API_TOKEN.
+
+    Публично: GET /api, /api/health, /api/news, /api/news/{id}.
+    Остальное — с сервисным ключом X-API-Key: <API_TOKEN> (его хранит бэкенд сайта)
+    и токеном администратора Authorization: Bearer <access_token> из /api/auth/login.
+    Authorization: Bearer <API_TOKEN> — полный доступ для скриптов на сервере.
+    """
+
+    PUBLIC = {("GET", "/api"), ("GET", "/api/health"), ("GET", "/api/news")}
 
     def __init__(self, client: discord.Client, token: str):
         self.client = client
         self.token = token
+        self.read_key = os.environ.get("API_PUBLIC_READ_KEY")
+        self.failed_logins: dict[str, list[float]] = {}
         self.app = web.Application(middlewares=[self.auth], client_max_size=1024 ** 2)
         self.app.add_routes([
+            web.get("/api", self.health),
             web.get("/api/health", self.health),
+            web.post("/api/auth/login", self.login),
+            web.get("/api/auth/me", self.me),
+            web.post("/api/auth/logout", self.logout),
             web.get("/api/news", self.list_news),
             web.post("/api/news", self.create_news),
             web.get("/api/news/{id}", self.get_news),
@@ -751,12 +827,57 @@ class NewsAPI:
         await web.TCPSite(runner, "0.0.0.0", port).start()
         log.info("API новостей слушает порт %s", port)
 
+    # ------------------------------------------------------------ доступ
+
+    def key_ok(self, value: str | None, *keys: str | None) -> bool:
+        return any(k and value and hmac.compare_digest(value.encode(), k.encode()) for k in keys)
+
+    async def session_user(self, request: web.Request) -> dict | None:
+        """Администратор по Bearer-токену; проверяет, что у него всё ещё есть роль поддержки."""
+        header = request.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return None
+        key = token_key(header[7:])
+        session = storage.get("sessions", key)
+        if not session or session["expires"] < time.time():
+            if session:
+                await storage.pop("sessions", key)
+            return None
+        user = storage.get("site_users", session["username"])
+        member = await self.staff_member(user) if user else None
+        if member is None:
+            await storage.pop("sessions", key)
+            return None
+        return {"username": session["username"], "member": member, "expires": session["expires"]}
+
+    async def staff_member(self, user: dict) -> discord.Member | None:
+        guild = self.client.get_guild(int(user["guild_id"]))
+        if guild is None:
+            return None
+        try:
+            member = guild.get_member(int(user["discord_id"])) or await guild.fetch_member(int(user["discord_id"]))
+        except discord.NotFound:
+            return None
+        return member if is_staff(member) else None
+
     @web.middleware
     async def auth(self, request: web.Request, handler):
-        if request.path != "/api/health":
-            header = request.headers.get("Authorization", "")
-            if not hmac.compare_digest(header.encode(), f"Bearer {self.token}".encode()):
-                return error(401, "unauthorized", "Нужен заголовок Authorization: Bearer <API_TOKEN>")
+        route = (request.method, request.path.rstrip("/") or "/")
+        is_public = route in self.PUBLIC or (request.method == "GET" and request.path.startswith("/api/news/"))
+        is_service = self.key_ok(request.headers.get("Authorization", "").removeprefix("Bearer "), self.token)
+        request["service"] = is_service
+
+        if is_public:
+            if self.read_key and not is_service and not self.key_ok(request.headers.get("X-API-Key"),
+                                                                     self.read_key, self.token):
+                return error(401, "unauthorized", "Нужен X-API-Key")
+        elif not is_service:
+            if not self.key_ok(request.headers.get("X-API-Key"), self.token):
+                return error(401, "unauthorized", "Нужен сервисный ключ X-API-Key")
+            if route != ("POST", "/api/auth/login"):
+                request["user"] = await self.session_user(request)
+                if request["user"] is None:
+                    return error(401, "unauthorized", "Войдите заново: токен недействителен или истёк")
         try:
             return await handler(request)
         except web.HTTPException:
@@ -767,8 +888,63 @@ class NewsAPI:
             log.exception("API: ошибка в %s %s", request.method, request.path)
             return error(500, "internal_error", "Внутренняя ошибка бота")
 
+    # ------------------------------------------------------------ авторизация
+
+    async def login(self, request: web.Request):
+        body = await read_json(request)
+        if isinstance(body, web.Response):
+            return body
+        username = str(body.get("username", "")).strip().lower()
+        password = str(body.get("password", ""))
+
+        now = time.time()
+        attempts = [t for t in self.failed_logins.get(username, []) if now - t < 900]
+        self.failed_logins[username] = attempts
+        if len(attempts) >= 5:
+            return error(429, "too_many_attempts", "Слишком много попыток, подождите 15 минут")
+
+        user = storage.get("site_users", username)
+        ok = user is not None and hmac.compare_digest(
+            await asyncio.to_thread(hash_password, password, bytes.fromhex(user["salt"])), user["hash"]
+        )
+        if not ok or await self.staff_member(user) is None:
+            attempts.append(now)
+            await asyncio.sleep(1)
+            return error(401, "invalid_credentials", "Неверный логин или пароль, или нет роли поддержки")
+
+        self.failed_logins.pop(username, None)
+        token = secrets.token_urlsafe(32)
+        await storage.set("sessions", token_key(token), {"username": username, "expires": now + SESSION_TTL})
+        log.info("Сайт: вход %s", username)
+        return web.json_response({"access_token": token, "token_type": "Bearer", "expires_in": SESSION_TTL})
+
+    async def me(self, request: web.Request):
+        if request["service"]:
+            return web.json_response({"authenticated": True, "user": {"username": "service", "roles": ["admin"]}})
+        user = request["user"]
+        member: discord.Member = user["member"]
+        return web.json_response({
+            "authenticated": True,
+            "user": {
+                "username": user["username"],
+                "name": member.display_name,
+                "discord_id": str(member.id),
+                "avatar_url": member.display_avatar.url,
+                "roles": ["admin"],
+            },
+            "expires_at": int(user["expires"]),
+        })
+
+    async def logout(self, request: web.Request):
+        header = request.headers.get("Authorization", "")
+        if header.startswith("Bearer "):
+            await storage.pop("sessions", token_key(header[7:]))
+        return web.json_response({"ok": True})
+
+    # ------------------------------------------------------------ новости
+
     async def health(self, request: web.Request):
-        return web.json_response({"ok": self.client.is_ready()})
+        return web.json_response({"ok": self.client.is_ready(), "service": "KrakenBot news API"})
 
     def resolve_guild(self, guild_id) -> discord.Guild | web.Response:
         if guild_id:
@@ -779,30 +955,39 @@ class NewsAPI:
             return configured[0]
         return error(400, "guild_required", "Бот на нескольких серверах — укажите guild_id")
 
+    def request_guild(self, request: web.Request, body: dict | None = None):
+        # администратор сайта работает только со своим сервером
+        if request.get("user"):
+            return request["user"]["member"].guild
+        return self.resolve_guild((body or {}).get("guild_id") or request.query.get("guild_id"))
+
     async def list_news(self, request: web.Request):
         guild = self.resolve_guild(request.query.get("guild_id"))
         if isinstance(guild, web.Response):
             return guild
         try:
-            limit = min(max(int(request.query.get("limit", 20)), 1), NEWS_KEEP)
+            limit = min(max(int(request.query.get("limit", 50)), 1), NEWS_KEEP)
             offset = max(int(request.query.get("offset", 0)), 0)
         except ValueError:
             return error(400, "bad_query", "limit и offset должны быть числами")
-        items = [i for i in news_list(guild.id) if i.get("id")]
-        return web.json_response({"items": items[offset:offset + limit], "total": len(items)})
+        # сайт отбрасывает всю ленту, если у одной записи пустое поле, поэтому неполные не отдаём
+        items = [public_news(i) for i in news_list(guild.id) if i.get("id") and i.get("title") and i.get("text")]
+        return web.json_response({"news": items[offset:offset + limit], "total": len(items)})
 
     async def get_news(self, request: web.Request):
         _, item = find_news(request.match_info["id"])
-        return web.json_response(item) if item else error(404, "not_found", "Новость не найдена")
+        return web.json_response(public_news(item)) if item else error(404, "not_found", "Новость не найдена")
 
     async def create_news(self, request: web.Request):
         body = await read_json(request)
         if isinstance(body, web.Response):
             return body
-        guild = self.resolve_guild(body.get("guild_id"))
+        guild = self.request_guild(request, body)
         if isinstance(guild, web.Response):
             return guild
 
+        if "text" in body and "body" not in body:
+            body["body"] = body["text"]
         problem = validate_news(body, partial=False)
         if problem:
             return error(422, "validation_error", problem)
@@ -811,32 +996,42 @@ class NewsAPI:
         channel = guild.get_channel(int(channel_id)) if str(channel_id or "").isdecimal() else None
         if not isinstance(channel, discord.TextChannel):
             return error(409, "news_channel_not_set",
-                         "Канал новостей не выбран: укажите channel_id или выберите канал в /setup")
+                         "Канал новостей не выбран: выберите его в /setup (пункт 4) или передайте channel_id")
 
-        if body.get("external_id"):
-            existing = next((i for i in news_list(guild.id) if i.get("external_id") == str(body["external_id"])), None)
-            if existing:  # повторный запрос с тем же external_id не создаёт дубль
-                return web.json_response(existing, status=200)
+        title, text = body["title"].strip(), body["body"].strip()
+        external_id = body.get("external_id") or request.headers.get("Idempotency-Key")
+        existing = find_duplicate(guild.id, external_id, title, text)
+        if existing:  # повтор после сетевого сбоя не создаёт вторую новость
+            return web.json_response(public_news(existing), status=200)
 
+        user = request.get("user")
+        author = body.get("author")
+        if user:
+            member = user["member"]
+            author = {"id": str(member.id), "name": member.display_name, "avatar_url": member.display_avatar.url}
         item = await publish_news(
             channel,
-            title=body["title"].strip(),
-            text=body["text"].strip(),
+            title=title,
+            text=text,
             image_urls=body.get("images") or [],
             mention=body.get("mention", "none"),
-            author=body.get("author"),
+            author=author,
             source="site",
-            external_id=str(body["external_id"]) if body.get("external_id") else None,
+            external_id=str(external_id) if external_id else None,
+            date=body.get("date"),
         )
-        return web.json_response(item, status=201)
+        log.info("Сайт: новость %s опубликована (%s)", item["id"], user["username"] if user else "service")
+        return web.json_response(public_news(item), status=201)
 
     async def update_news(self, request: web.Request):
         guild_id, item = find_news(request.match_info["id"])
-        if not item:
+        if not item or (request.get("user") and request["user"]["member"].guild.id != guild_id):
             return error(404, "not_found", "Новость не найдена")
         body = await read_json(request)
         if isinstance(body, web.Response):
             return body
+        if "text" in body and "body" not in body:
+            body["body"] = body["text"]
         problem = validate_news(body, partial=True)
         if problem:
             return error(422, "validation_error", problem)
@@ -851,7 +1046,9 @@ class NewsAPI:
             return error(410, "gone", "Сообщение новости удалено в Discord")
 
         item["title"] = body.get("title", item["title"]).strip()
-        item["text"] = body.get("text", item["text"]).strip()
+        item["text"] = body.get("body", item["text"]).strip()
+        if body.get("date"):
+            item["date"] = body["date"]
         embeds = message.embeds
         embeds[0].title = f"📰 {item['title']}"
         embeds[0].description = item["text"]
@@ -859,11 +1056,11 @@ class NewsAPI:
 
         item["updated_at"] = discord.utils.utcnow().isoformat()
         await save_news(guild_id, news_list(guild_id))
-        return web.json_response(item)
+        return web.json_response(public_news(item))
 
     async def delete_news(self, request: web.Request):
         guild_id, item = find_news(request.match_info["id"])
-        if not item:
+        if not item or (request.get("user") and request["user"]["member"].guild.id != guild_id):
             return error(404, "not_found", "Новость не найдена")
         # сначала убираем из хранилища, чтобы on_raw_message_delete не отправил удаление обратно на сайт
         await save_news(guild_id, [i for i in news_list(guild_id) if i is not item])
@@ -875,6 +1072,17 @@ class NewsAPI:
             except discord.NotFound:
                 pass
         return web.Response(status=204)
+
+
+def find_duplicate(guild_id: int, external_id, title: str, text: str) -> dict | None:
+    now = discord.utils.utcnow()
+    for item in news_list(guild_id):
+        if external_id and item.get("external_id") == str(external_id):
+            return item
+        if (not external_id and item.get("source") == "site" and item["title"] == title and item["text"] == text
+                and (now - datetime.fromisoformat(item["created_at"])).total_seconds() < DUPLICATE_WINDOW):
+            return item
+    return None
 
 
 def error(status: int, code: str, message: str) -> web.Response:
@@ -890,7 +1098,7 @@ async def read_json(request: web.Request) -> dict | web.Response:
 
 
 def validate_news(body: dict, *, partial: bool) -> str | None:
-    for field, limit in (("title", 250), ("text", 4000)):
+    for field, limit in (("title", 250), ("body", 4000)):
         if field not in body and partial:
             continue
         value = body.get(field)
@@ -898,8 +1106,16 @@ def validate_news(body: dict, *, partial: bool) -> str | None:
             return f"Поле {field} обязательно и должно быть непустой строкой"
         if len(value) > limit:
             return f"Поле {field} длиннее {limit} символов"
+    date = body.get("date")
+    if date is not None:
+        try:
+            datetime.strptime(str(date), "%Y-%m-%d")
+        except ValueError:
+            return "date — дата в формате YYYY-MM-DD"
     if partial:
         return None
+    if body.get("status", "published") != "published":
+        return "Поддерживается только status=published (черновики не хранятся)"
     images = body.get("images", [])
     if not isinstance(images, list) or len(images) > 10 or not all(
         isinstance(u, str) and u.startswith(("https://", "http://")) for u in images
@@ -1503,7 +1719,9 @@ class KrakenBot(discord.Client):
                 "видят по кнопке «Новости» и команде `/news`.\n\n"
                 "**🛠️ Ход разработки** — сводка, которую игроки видят по кнопке «Разработка» и `/progress`.\n\n"
                 "**📌 Панель сообщества** — сообщение с кнопками для игроков: "
-                "Об игре · Новости · Разработка · Идея · Ошибка."
+                "Об игре · Новости · Разработка · Идея · Ошибка.\n\n"
+                "**🔑 Доступ к сайту** — личный логин и пароль для публикации новостей на сайте. "
+                "Новость с сайта появляется и в Discord."
             ),
             color=discord.Color.dark_teal(),
         )

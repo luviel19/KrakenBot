@@ -1,0 +1,7 @@
+# HTTPS для API новостей. Сертификат Let's Encrypt Caddy получает и продлевает сам
+# (нужен свободный порт 80 на сервере). API_DOMAIN задаётся в .env.
+{$API_DOMAIN}:{$API_HTTPS_PORT:47821} {
+	reverse_proxy bot:8080
+	encode gzip
+	header -Server
+}

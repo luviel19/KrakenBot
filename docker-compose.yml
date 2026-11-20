@@ -3,11 +3,29 @@ services:
     image: ghcr.io/luviel19/krakenbot:latest
     restart: unless-stopped
     env_file: .env
-    ports:
-      # API новостей для сайта; порт снаружи меняется через API_PUBLIC_PORT в .env
-      - "${API_PUBLIC_PORT:-8080}:8080"
+    # API наружу не открыт: к нему обращаются только через HTTPS-прокси caddy
+    expose:
+      - "8080"
     volumes:
       - bot-data:/data
 
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    depends_on:
+      - bot
+    environment:
+      API_DOMAIN: ${API_DOMAIN}
+      API_HTTPS_PORT: ${API_HTTPS_PORT:-47821}
+    ports:
+      - "80:80"  # только для получения и продления сертификата
+      - "${API_HTTPS_PORT:-47821}:${API_HTTPS_PORT:-47821}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   bot-data:
+  caddy-data:
+  caddy-config:
