@@ -13,13 +13,15 @@ from discord import app_commands, ui
 
 # ---------------------------------------------------------------- настройки
 
+# Каждый сервер настраивается мастером (/setup или сообщение в ЛС при добавлении бота),
+# настройки хранятся в data.json. Значения ниже — для сервера, где бот работал до мастера:
+# при первом запуске они переносятся в его настройки автоматически.
 STAFF_ROLE_ID = 898463898582253568
-# Каналы ищутся по id, поэтому их можно спокойно переименовывать.
-# Имя используется, только если канала с таким id нет и его нужно создать.
 TICKET_CHANNEL_ID = 1571844747327316069
+
+# имена каналов, которые бот создаёт, если в мастере выбрано «Создать новый»
 TICKET_CHANNEL_NAME = "тикеты"
-STAFF_CHANNEL_ID = None  # бот запомнит созданный канал сам; можно вписать id вручную
-STAFF_CHANNEL_NAME = "функционал-бота"  # видит только STAFF_ROLE_ID
+STAFF_CHANNEL_NAME = "функционал-бота"
 DATA_FILE = Path(os.environ.get("DATA_DIR", Path(__file__).parent)) / "data.json"
 TICKET_COOLDOWN = 120  # секунд между тикетами одного игрока (на роль поддержки не действует)
 
@@ -31,7 +33,16 @@ GAME_INFO = (
     "Здесь можно следить за официальными новостями разработки, "
     "предлагать идеи и сообщать об ошибках."
 )
+HUB_GREETING = "Добро пожаловать, рыболов! 🎣"
 GAME_COLOR = discord.Color.from_rgb(36, 116, 132)
+
+# для новых серверов, где в мастере не задали своё описание
+DEFAULT_GAME_NAME = "Наша игра"
+DEFAULT_GAME_INFO = (
+    "Добро пожаловать в сообщество {name}!\n\n"
+    "Здесь можно следить за новостями разработки, предлагать идеи и сообщать об ошибках."
+)
+DEFAULT_HUB_GREETING = "Добро пожаловать! 👋"
 
 # ключ -> (название, эмодзи, описание в выпадающем списке)
 CATEGORIES = {
@@ -78,7 +89,7 @@ class Storage:
         self.lock = asyncio.Lock()
         self.data = {
             "counters": {}, "panels": {}, "staff_panels": {}, "tickets": {}, "polls": {},
-            "news": {}, "progress": {},
+            "news": {}, "progress": {}, "config": {}, "setup_drafts": {},
         }
         if path.exists():
             self.data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -102,6 +113,11 @@ class Storage:
             await self._save()
             return number
 
+    async def pop(self, section: str, key: int):
+        async with self.lock:
+            if self.data[section].pop(str(key), None) is not None:
+                await self._save()
+
     async def set(self, section: str, key: int, value):
         async with self.lock:
             self.data[section][str(key)] = value
@@ -115,8 +131,36 @@ storage = Storage(DATA_FILE)
 last_ticket_at: dict[tuple[int, int], float] = {}
 
 
+def guild_config(guild_id: int) -> dict:
+    return storage.get("config", guild_id) or {}
+
+
+def staff_role_id(guild_id: int) -> int | None:
+    return guild_config(guild_id).get("staff_role_id")
+
+
+def staff_mention(guild_id: int) -> str:
+    role_id = staff_role_id(guild_id)
+    return f"<@&{role_id}>" if role_id else "команда сервера"
+
+
+def game_name(guild_id: int) -> str:
+    return guild_config(guild_id).get("game_name") or DEFAULT_GAME_NAME
+
+
+def game_info(guild_id: int) -> str:
+    return guild_config(guild_id).get("game_info") or DEFAULT_GAME_INFO.format(name=game_name(guild_id))
+
+
 def is_staff(member: discord.abc.User) -> bool:
-    return isinstance(member, discord.Member) and member.get_role(STAFF_ROLE_ID) is not None
+    if not isinstance(member, discord.Member):
+        return False
+    role_id = staff_role_id(member.guild.id)
+    return role_id is not None and member.get_role(role_id) is not None
+
+
+def can_configure(member: discord.Member | None) -> bool:
+    return member is not None and (member.guild_permissions.manage_guild or member.guild_permissions.administrator)
 
 
 # ---------------------------------------------------------------- форма тикета
@@ -209,7 +253,7 @@ async def create_ticket(interaction: discord.Interaction, *, category_key, subje
         poll_message=poll_message,
     )
     await thread.send(
-        content=f"{interaction.user.mention} создал тикет. <@&{STAFF_ROLE_ID}>",
+        content=f"{interaction.user.mention} создал тикет. {staff_mention(interaction.guild.id)}",
         embed=embed,
         view=StatusView(),
         allowed_mentions=discord.AllowedMentions(users=True, roles=True),
@@ -228,17 +272,17 @@ async def create_ticket(interaction: discord.Interaction, *, category_key, subje
 
 
 def ticket_channel(guild: discord.Guild) -> discord.TextChannel | None:
-    return find_channel(guild, TICKET_CHANNEL_ID, "panels", TICKET_CHANNEL_NAME)
+    return config_channel(guild, "ticket_channel_id")
 
 
-def find_channel(guild: discord.Guild, channel_id, section: str, name: str) -> discord.TextChannel | None:
-    """Канал по id из настроек, затем по id, который бот запомнил, и только потом по имени."""
-    panel = storage.get(section, guild.id)
-    for cid in (channel_id, panel and panel["channel_id"]):
-        channel = guild.get_channel(cid) if cid else None
-        if isinstance(channel, discord.TextChannel):
-            return channel
-    return discord.utils.get(guild.text_channels, name=name)
+def staff_channel(guild: discord.Guild) -> discord.TextChannel | None:
+    return config_channel(guild, "staff_channel_id")
+
+
+def config_channel(guild: discord.Guild, key: str) -> discord.TextChannel | None:
+    # каналы ищутся только по id, поэтому их можно переименовывать
+    channel = guild.get_channel(guild_config(guild.id).get(key) or 0)
+    return channel if isinstance(channel, discord.TextChannel) else None
 
 
 def ticket_embed(*, number, category_key, author, subject, description, version,
@@ -284,7 +328,7 @@ class StatusView(ui.View):
         if is_staff(interaction.user):
             return True
         await interaction.response.send_message(
-            f"Менять статус тикета может только <@&{STAFF_ROLE_ID}>.", ephemeral=True
+            f"Менять статус тикета может только {staff_mention(interaction.guild.id)}.", ephemeral=True
         )
         return False
 
@@ -402,7 +446,7 @@ class PostModal(ui.Modal):
         embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
         embed.set_footer(
             text="Есть мысли? Нажмите «Есть идея» — ответ увидит только команда"
-            if is_poll else f"Новости {GAME_NAME}"
+            if is_poll else f"Новости {game_name(interaction.guild.id)}"
         )
 
         files = [await a.to_file() for a in self.images.component.values]
@@ -513,7 +557,8 @@ class StaffPanelView(ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if is_staff(interaction.user):
             return True
-        await interaction.response.send_message(f"Доступно только <@&{STAFF_ROLE_ID}>.", ephemeral=True)
+        await interaction.response.send_message(f"Доступно только {staff_mention(interaction.guild.id)}.",
+                                                ephemeral=True)
         return False
 
     @ui.button(label="Создать опрос", emoji="📢", style=discord.ButtonStyle.primary, custom_id="staff:poll")
@@ -567,7 +612,7 @@ class HubModal(ui.Modal, title="Панель сообщества"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         channel = interaction.guild.get_channel(self.target.component.values[0].id)
         try:
-            message = await channel.send(embed=hub_embed(), view=HubView())
+            message = await channel.send(embed=hub_embed(interaction.guild.id), view=HubView())
         except (discord.Forbidden, AttributeError):
             await interaction.followup.send("У бота нет прав писать в этот канал.", ephemeral=True)
             return
@@ -579,11 +624,12 @@ class HubModal(ui.Modal, title="Панель сообщества"):
 # ---------------------------------------------------------------- центр сообщества
 
 
-def hub_embed() -> discord.Embed:
+def hub_embed(guild_id: int) -> discord.Embed:
+    greeting = guild_config(guild_id).get("hub_greeting") or DEFAULT_HUB_GREETING
     embed = discord.Embed(
-        title=f"🐙 {GAME_NAME} | Центр сообщества",
+        title=f"🐙 {game_name(guild_id)} | Центр сообщества",
         description=(
-            "**Добро пожаловать, рыболов!** 🎣\n\n"
+            f"**{greeting}**\n\n"
             "Читайте новости, следите за разработкой, делитесь идеями "
             "и сообщайте об ошибках с помощью кнопок ниже."
         ),
@@ -593,9 +639,10 @@ def hub_embed() -> discord.Embed:
     return embed
 
 
-def info_embed() -> discord.Embed:
-    embed = discord.Embed(title=f"🎣 {GAME_NAME}", description=GAME_INFO, color=GAME_COLOR)
-    embed.set_footer(text=f"{GAME_NAME} • Новости и статусы публикует команда разработки")
+def info_embed(guild_id: int) -> discord.Embed:
+    name = game_name(guild_id)
+    embed = discord.Embed(title=f"🎮 {name}", description=game_info(guild_id), color=GAME_COLOR)
+    embed.set_footer(text=f"{name} • Новости и статусы публикует команда разработки")
     return embed
 
 
@@ -629,7 +676,7 @@ class HubView(ui.View):
 
     @ui.button(label="Об игре", emoji="🎣", style=discord.ButtonStyle.secondary, custom_id="hub:about")
     async def about(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_message(embed=info_embed(), ephemeral=True)
+        await interaction.response.send_message(embed=info_embed(interaction.guild.id), ephemeral=True)
 
     @ui.button(label="Новости", emoji="📰", style=discord.ButtonStyle.secondary, custom_id="hub:news")
     async def news(self, interaction: discord.Interaction, button: ui.Button):
@@ -649,6 +696,299 @@ class HubView(ui.View):
 
 
 
+# ---------------------------------------------------------------- мастер настройки
+#
+# Работает и в ЛС, и в /setup. В ЛС Discord не может показать роли и каналы сервера
+# во встроенных списках, поэтому списки заполняются самим ботом (до 25 пунктов).
+# id сервера зашит в custom_id, так что кнопки работают и после перезапуска бота.
+
+NEW_CHANNEL = "new"
+
+
+def setup_draft(guild: discord.Guild) -> dict:
+    """Черновик настроек: то, что выбрано в мастере, поверх текущих настроек сервера."""
+    draft = storage.get("setup_drafts", guild.id)
+    if draft is None:
+        cfg = guild_config(guild.id)
+        draft = {
+            "staff_role_id": cfg.get("staff_role_id"),
+            "ticket_channel": cfg.get("ticket_channel_id") or NEW_CHANNEL,
+            "staff_channel": cfg.get("staff_channel_id") or NEW_CHANNEL,
+            "game_name": cfg.get("game_name"),
+            "game_info": cfg.get("game_info"),
+            "hub_greeting": cfg.get("hub_greeting"),
+        }
+    return draft
+
+
+def setup_embed(guild: discord.Guild, draft: dict, note: str | None = None) -> discord.Embed:
+    def channel_text(value, default_name):
+        if value == NEW_CHANNEL:
+            return f"➕ будет создан **#{default_name}**"
+        channel = guild.get_channel(value)
+        return channel.mention + f" (#{channel.name})" if channel else "⚠️ канал удалён — выберите другой"
+
+    role = guild.get_role(draft["staff_role_id"] or 0)
+    embed = discord.Embed(
+        title=f"⚙️ Настройка KrakenBot — {guild.name}",
+        description=(
+            "Выберите в списках ниже, как бот будет работать на сервере, и нажмите **«Сохранить и запустить»**. "
+            "Настройки можно изменить позже командой `/setup` на сервере."
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(
+        name="1. Роль поддержки",
+        value=(f"{role.mention} (@{role.name})" if role else "❗ не выбрана")
+        + "\nВидит все тикеты, меняет статусы, публикует опросы и новости",
+        inline=False,
+    )
+    embed.add_field(
+        name="2. Канал тикетов",
+        value=channel_text(draft["ticket_channel"], TICKET_CHANNEL_NAME)
+        + "\nКнопка «Создать тикет», внутри — приватные ветки",
+        inline=False,
+    )
+    embed.add_field(
+        name="3. Канал команды",
+        value=channel_text(draft["staff_channel"], STAFF_CHANNEL_NAME)
+        + "\nВидит только роль поддержки: опросы, новости, ход разработки",
+        inline=False,
+    )
+    embed.add_field(
+        name="4. Игра",
+        value=f"**{draft['game_name'] or DEFAULT_GAME_NAME}** — кнопка «✏️ Игра», чтобы изменить название и описание",
+        inline=False,
+    )
+    embed.set_footer(text="Бот выставит права в выбранных каналах. Нужны права «Управлять каналами» и «Управлять ролями».")
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    if note:
+        embed.add_field(name="\u200b", value=note, inline=False)
+    return embed
+
+
+def setup_view(guild: discord.Guild, draft: dict) -> ui.View:
+    view = ui.View(timeout=None)
+    view.add_item(SetupSelect(guild, "role", draft))
+    view.add_item(SetupSelect(guild, "tickets", draft))
+    view.add_item(SetupSelect(guild, "staff", draft))
+    view.add_item(SetupButton(guild.id, "save"))
+    view.add_item(SetupButton(guild.id, "game"))
+    return view
+
+
+async def configurer(interaction: discord.Interaction, guild: discord.Guild) -> discord.Member | None:
+    """Участник сервера, который нажал кнопку мастера (в ЛС его нужно запросить у Discord)."""
+    if isinstance(interaction.user, discord.Member) and interaction.user.guild == guild:
+        return interaction.user
+    try:
+        return guild.get_member(interaction.user.id) or await guild.fetch_member(interaction.user.id)
+    except discord.NotFound:
+        return None
+
+
+async def check_setup_access(interaction: discord.Interaction, guild: discord.Guild | None) -> bool:
+    if guild is None:
+        await interaction.response.send_message("Бота уже нет на этом сервере.", ephemeral=True)
+        return False
+    if not can_configure(await configurer(interaction, guild)):
+        await interaction.response.send_message(
+            "Настраивать бота могут участники с правом «Управлять сервером».", ephemeral=True
+        )
+        return False
+    return True
+
+
+class SetupSelect(ui.DynamicItem[ui.Select], template=r"setup:(?P<field>role|tickets|staff):(?P<gid>\d+)"):
+    def __init__(self, guild: discord.Guild, field: str, draft: dict | None = None):
+        self.guild = guild
+        self.field = field
+        draft = draft or setup_draft(guild)
+        if field == "role":
+            roles = [r for r in reversed(guild.roles) if not r.is_default() and not r.managed][:25]
+            options = [
+                discord.SelectOption(label=r.name[:100], value=str(r.id), default=r.id == draft["staff_role_id"])
+                for r in roles
+            ] or [discord.SelectOption(label="На сервере нет ролей — создайте роль и откройте /setup", value="0")]
+            placeholder = "1. Роль поддержки"
+        else:
+            key = "ticket_channel" if field == "tickets" else "staff_channel"
+            name = TICKET_CHANNEL_NAME if field == "tickets" else STAFF_CHANNEL_NAME
+            channels = sorted(guild.text_channels, key=lambda c: c.position)[:24]
+            options = [discord.SelectOption(label=f"➕ Создать новый #{name}", value=NEW_CHANNEL,
+                                            default=draft[key] == NEW_CHANNEL)]
+            options += [
+                discord.SelectOption(
+                    label=f"#{c.name}"[:100],
+                    value=str(c.id),
+                    description=(c.category.name if c.category else None),
+                    default=c.id == draft[key],
+                )
+                for c in channels
+            ]
+            placeholder = "2. Канал тикетов" if field == "tickets" else "3. Канал команды"
+        super().__init__(ui.Select(custom_id=f"setup:{field}:{guild.id}", placeholder=placeholder, options=options))
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: ui.Select, match):
+        guild = interaction.client.get_guild(int(match["gid"]))
+        if guild is None:
+            raise ValueError("бот не на сервере")
+        return cls(guild, match["field"])
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await check_setup_access(interaction, self.guild)
+
+    async def callback(self, interaction: discord.Interaction):
+        draft = setup_draft(self.guild)
+        value = self.item.values[0]
+        if self.field == "role":
+            draft["staff_role_id"] = int(value) or None
+        else:
+            key = "ticket_channel" if self.field == "tickets" else "staff_channel"
+            draft[key] = value if value == NEW_CHANNEL else int(value)
+        await storage.set("setup_drafts", self.guild.id, draft)
+        await interaction.response.edit_message(embed=setup_embed(self.guild, draft), view=setup_view(self.guild, draft))
+
+
+class SetupButton(ui.DynamicItem[ui.Button], template=r"setup:(?P<action>save|game):(?P<gid>\d+)"):
+    def __init__(self, guild_id: int, action: str):
+        self.guild_id = guild_id
+        self.action = action
+        if action == "save":
+            button = ui.Button(label="Сохранить и запустить", emoji="✅", style=discord.ButtonStyle.success,
+                               custom_id=f"setup:save:{guild_id}")
+        else:
+            button = ui.Button(label="Игра", emoji="✏️", style=discord.ButtonStyle.secondary,
+                               custom_id=f"setup:game:{guild_id}")
+        super().__init__(button)
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: ui.Button, match):
+        return cls(int(match["gid"]), match["action"])
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await check_setup_access(interaction, interaction.client.get_guild(self.guild_id))
+
+    async def callback(self, interaction: discord.Interaction):
+        guild = interaction.client.get_guild(self.guild_id)
+        draft = setup_draft(guild)
+        if self.action == "game":
+            await interaction.response.send_modal(GameModal(guild, draft))
+            return
+
+        if not guild.get_role(draft["staff_role_id"] or 0):
+            await interaction.response.edit_message(
+                embed=setup_embed(guild, draft, "❗ Сначала выберите **роль поддержки**."), view=setup_view(guild, draft)
+            )
+            return
+
+        await interaction.response.defer()
+        config = guild_config(guild.id)
+        config.update({
+            "staff_role_id": draft["staff_role_id"],
+            "ticket_channel_id": None if draft["ticket_channel"] == NEW_CHANNEL else draft["ticket_channel"],
+            "staff_channel_id": None if draft["staff_channel"] == NEW_CHANNEL else draft["staff_channel"],
+            "game_name": draft["game_name"],
+            "game_info": draft["game_info"],
+            "hub_greeting": draft["hub_greeting"],
+        })
+        await storage.set("config", guild.id, config)
+
+        error = await interaction.client.setup_guild(guild)
+        if error:
+            await interaction.edit_original_response(
+                embed=setup_embed(guild, draft, f"❌ {error}\nИсправьте и нажмите «Сохранить и запустить» ещё раз."),
+                view=setup_view(guild, draft),
+            )
+            return
+
+        await storage.pop("setup_drafts", guild.id)
+        tickets, staff = ticket_channel(guild), staff_channel(guild)
+        done = discord.Embed(
+            title=f"✅ KrakenBot настроен — {guild.name}",
+            description=(
+                f"**Тикеты:** {tickets.mention}\n"
+                f"**Канал команды:** {staff.mention}\n"
+                f"**Роль поддержки:** {staff_mention(guild.id)}\n\n"
+                f"Дальше: в {staff.mention} нажмите **📌 Панель сообщества**, чтобы опубликовать "
+                "кнопки для игроков, и **🛠️ Ход разработки**, чтобы заполнить сводку.\n\n"
+                "Изменить настройки — команда `/setup` на сервере."
+            ),
+            color=discord.Color.green(),
+        )
+        await interaction.edit_original_response(embed=done, view=None)
+
+
+class GameModal(ui.Modal, title="Игра"):
+    name = ui.Label(
+        text="Название игры",
+        component=ui.TextInput(placeholder="Например: FISHING UNBOUND", max_length=60),
+    )
+    greeting = ui.Label(
+        text="Приветствие на панели сообщества",
+        component=ui.TextInput(placeholder=DEFAULT_HUB_GREETING, required=False, max_length=100),
+    )
+    info = ui.Label(
+        text="Об игре",
+        description="Показывается по кнопке «Об игре» и команде /info",
+        component=ui.TextInput(style=discord.TextStyle.paragraph, required=False, max_length=2000),
+    )
+
+    def __init__(self, guild: discord.Guild, draft: dict):
+        super().__init__()
+        self.guild = guild
+        self.name.component.default = draft["game_name"]
+        self.greeting.component.default = draft["hub_greeting"]
+        self.info.component.default = draft["game_info"]
+
+    async def on_submit(self, interaction: discord.Interaction):
+        draft = setup_draft(self.guild)
+        draft["game_name"] = self.name.component.value.strip() or None
+        draft["hub_greeting"] = self.greeting.component.value.strip() or None
+        draft["game_info"] = self.info.component.value.strip() or None
+        await storage.set("setup_drafts", self.guild.id, draft)
+        await interaction.response.edit_message(embed=setup_embed(self.guild, draft), view=setup_view(self.guild, draft))
+
+
+async def send_setup_dm(client: discord.Client, guild: discord.Guild) -> bool:
+    """Отправляет мастер в ЛС тому, кто добавил бота (или владельцу сервера)."""
+    user = None
+    try:
+        async for entry in guild.audit_logs(limit=10, action=discord.AuditLogAction.bot_add):
+            if entry.target and entry.target.id == client.user.id:
+                user = entry.user
+                break
+    except discord.Forbidden:
+        pass  # нет права «Просматривать журнал аудита» — напишем владельцу
+    if user is None:
+        user = guild.owner or await client.fetch_user(guild.owner_id)
+
+    draft = setup_draft(guild)
+    intro = (
+        f"👋 Привет! Меня добавили на сервер **{guild.name}**.\n"
+        "Давайте настроим тикеты, роль поддержки и каналы — это займёт минуту."
+    )
+    try:
+        await user.send(intro, embed=setup_embed(guild, draft), view=setup_view(guild, draft))
+        log.info("Сервер %s: мастер настройки отправлен в ЛС %s", guild, user)
+        return True
+    except discord.HTTPException:
+        log.warning("Сервер %s: не удалось написать %s в ЛС", guild, user)
+
+    channel = guild.system_channel or next(
+        (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages), None
+    )
+    if channel:
+        await channel.send(
+            f"👋 {user.mention}, я не смог написать вам в личные сообщения. "
+            "Настройте бота командой **`/setup`** (нужно право «Управлять сервером»).",
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
+    return False
+
+
 # ---------------------------------------------------------------- бот
 
 
@@ -666,12 +1006,13 @@ class KrakenBot(discord.Client):
         self.add_view(PollView())
         self.add_view(StaffPanelView())
         self.add_view(HubView())
+        self.add_dynamic_items(SetupSelect, SetupButton)
 
     def add_player_commands(self):
-        @self.tree.command(name="info", description=f"Информация о {GAME_NAME}")
+        @self.tree.command(name="info", description="Информация об игре")
         @app_commands.guild_only()
         async def info(interaction: discord.Interaction):
-            await interaction.response.send_message(embed=info_embed(), ephemeral=True)
+            await interaction.response.send_message(embed=info_embed(interaction.guild.id), ephemeral=True)
 
         @self.tree.command(name="news", description="Последние новости разработки")
         @app_commands.guild_only()
@@ -698,27 +1039,44 @@ class KrakenBot(discord.Client):
         async def ticket(interaction: discord.Interaction):
             await interaction.response.send_modal(TicketModal())
 
+        @self.tree.command(name="setup", description="Настроить бота на этом сервере")
+        @app_commands.guild_only()
+        @app_commands.default_permissions(manage_guild=True)
+        async def setup(interaction: discord.Interaction):
+            if not can_configure(interaction.user):
+                await interaction.response.send_message("Нужно право «Управлять сервером».", ephemeral=True)
+                return
+            draft = setup_draft(interaction.guild)
+            await interaction.response.send_message(
+                embed=setup_embed(interaction.guild, draft), view=setup_view(interaction.guild, draft), ephemeral=True
+            )
+
     async def on_ready(self):
         log.info("Вошёл как %s", self.user)
         if self.ready_once:
             return
         self.ready_once = True
         # серверы настраиваются параллельно, а не по очереди
-        await asyncio.gather(*(self.setup_guild(guild) for guild in self.guilds))
+        await asyncio.gather(*(self.start_guild(guild) for guild in self.guilds))
 
     async def on_guild_join(self, guild: discord.Guild):
-        await self.setup_guild(guild)
+        log.info("Добавлен на сервер %s", guild)
+        await self.start_guild(guild)
 
-    async def setup_guild(self, guild: discord.Guild):
-        try:
-            channel = await self.ensure_channel(guild)
-            await self.ensure_panel(channel)
-            staff_channel = await self.ensure_staff_channel(guild)
-            if staff_channel is not None:
-                await self.ensure_staff_panel(staff_channel)
-        except discord.Forbidden:
-            log.error("Сервер %s: боту не хватает прав (нужны «Управлять каналами» и «Управлять ролями»)", guild)
+    async def start_guild(self, guild: discord.Guild):
+        await self.sync_commands(guild)
+        await migrate_legacy_config(guild)
+        if guild_config(guild.id).get("staff_role_id"):
+            if error := await self.setup_guild(guild):
+                log.error("Сервер %s: %s", guild, error)
+        elif not guild_config(guild.id).get("setup_dm_sent"):
+            # новый сервер: отправляем мастер настройки один раз
+            await send_setup_dm(self, guild)
+            await storage.set("config", guild.id, {**guild_config(guild.id), "setup_dm_sent": True})
+        else:
+            log.info("Сервер %s: не настроен — ждём /setup", guild)
 
+    async def sync_commands(self, guild: discord.Guild):
         # регистрация на конкретном сервере появляется сразу, глобальная — до часа
         self.tree.copy_global_to(guild=guild)
         try:
@@ -727,10 +1085,21 @@ class KrakenBot(discord.Client):
         except discord.Forbidden:
             log.error("Сервер %s: нет доступа к командам — пригласите бота со scope applications.commands", guild)
 
+    async def setup_guild(self, guild: discord.Guild) -> str | None:
+        """Создаёт/обновляет каналы и панели по настройкам сервера. Возвращает текст ошибки или None."""
+        if guild.get_role(staff_role_id(guild.id) or 0) is None:
+            return "Роль поддержки не найдена на сервере — выберите её в /setup."
+        try:
+            channel = await self.ensure_channel(guild)
+            await self.ensure_panel(channel)
+            await self.ensure_staff_panel(await self.ensure_staff_channel(guild))
+        except discord.Forbidden:
+            return ("Боту не хватает прав. Выдайте роли бота «Управлять каналами», «Управлять ролями» "
+                    "и «Управлять ветками».")
+        return None
+
     async def ensure_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        staff = guild.get_role(STAFF_ROLE_ID)
-        if staff is None:
-            log.warning("Сервер %s: роль %s не найдена", guild, STAFF_ROLE_ID)
+        staff = guild.get_role(staff_role_id(guild.id) or 0)
 
         overwrites = {
             # все видят канал и кнопку, но не пишут в него и не создают ветки сами
@@ -771,15 +1140,14 @@ class KrakenBot(discord.Client):
                 topic="Нашли баг или есть идея? Нажмите «Создать тикет».",
                 reason="Канал тикетов",
             )
+            await storage.set("config", guild.id, {**guild_config(guild.id), "ticket_channel_id": channel.id})
             log.info("Сервер %s: создан канал #%s", guild, channel.name)
         else:
             await channel.edit(overwrites=overwrites, reason="Права канала тикетов")
         return channel
 
-    async def ensure_staff_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
-        staff = guild.get_role(STAFF_ROLE_ID)
-        if staff is None:
-            return None
+    async def ensure_staff_channel(self, guild: discord.Guild) -> discord.TextChannel:
+        staff = guild.get_role(staff_role_id(guild.id))
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             staff: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
@@ -787,11 +1155,12 @@ class KrakenBot(discord.Client):
                 view_channel=True, send_messages=True, embed_links=True, read_message_history=True
             ),
         }
-        channel = find_channel(guild, STAFF_CHANNEL_ID, "staff_panels", STAFF_CHANNEL_NAME)
+        channel = staff_channel(guild)
         if channel is None:
             channel = await guild.create_text_channel(
                 STAFF_CHANNEL_NAME, overwrites=overwrites, topic="Функционал бота для команды", reason="Канал команды"
             )
+            await storage.set("config", guild.id, {**guild_config(guild.id), "staff_channel_id": channel.id})
             log.info("Сервер %s: создан канал #%s", guild, channel.name)
         else:
             await channel.edit(overwrites=overwrites, reason="Права канала команды")
@@ -831,6 +1200,27 @@ class KrakenBot(discord.Client):
             inline=False,
         )
         await upsert_panel(channel, "panels", "ticket:create", embed, PanelView())
+
+
+async def migrate_legacy_config(guild: discord.Guild):
+    """Сервер, где бот работал до мастера настройки: переносим старые константы в его настройки."""
+    if guild_config(guild.id).get("staff_role_id") or guild.get_role(STAFF_ROLE_ID) is None:
+        return
+
+    def known_channel(*ids):
+        return next((cid for cid in ids if cid and isinstance(guild.get_channel(cid), discord.TextChannel)), None)
+
+    panels, staff_panels = storage.get("panels", guild.id), storage.get("staff_panels", guild.id)
+    await storage.set("config", guild.id, {
+        **guild_config(guild.id),
+        "staff_role_id": STAFF_ROLE_ID,
+        "ticket_channel_id": known_channel(TICKET_CHANNEL_ID, panels and panels["channel_id"]),
+        "staff_channel_id": known_channel(staff_panels and staff_panels["channel_id"]),
+        "game_name": GAME_NAME,
+        "game_info": GAME_INFO,
+        "hub_greeting": HUB_GREETING,
+    })
+    log.info("Сервер %s: старые настройки перенесены в config", guild)
 
 
 async def upsert_panel(channel: discord.TextChannel, section: str, custom_id: str,

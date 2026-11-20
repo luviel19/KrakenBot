@@ -4,13 +4,19 @@
 1. https://discord.com/developers/applications → New Application → Bot → скопировать токен.
 2. OAuth2 → URL Generator: отметить только `bot`, ниже в «Разрешениях бота» — Manage Channels,
    Manage Roles, View Channels, Send Messages, Send Messages in Threads, Create Private Threads,
-   Manage Threads, Manage Messages, Embed Links, Attach Files, Read Message History, Mention Everyone.
-   Или готовая ссылка: `https://discord.com/oauth2/authorize?client_id=ID_ПРИЛОЖЕНИЯ&scope=bot&permissions=361045945360`
+   Manage Threads, Manage Messages, Embed Links, Attach Files, Read Message History, Mention Everyone,
+   View Audit Log (чтобы бот знал, кто его добавил, и написал ему мастер настройки).
+   Или готовая ссылка: `https://discord.com/oauth2/authorize?client_id=ID_ПРИЛОЖЕНИЯ&scope=bot+applications.commands&permissions=361045945488`
 3. `pip install -r requirements.txt`
 4. Скопировать `.env.example` в `.env` и вписать токен.
 5. `python bot.py`
 
-При запуске бот сам создаёт канал `#тикеты` (если его нет), выставляет права и публикует панель с кнопкой.
+## Настройка сервера
+Когда бота добавляют на новый сервер, тому, кто его добавил (или владельцу сервера), приходит в ЛС мастер:
+роль поддержки, канал тикетов, канал команды (выбрать существующий или создать новый), название и описание игры.
+После «Сохранить и запустить» бот создаёт каналы, выставляет права и публикует панели.
+Изменить настройки — команда `/setup` на сервере (нужно право «Управлять сервером»).
+Если ЛС закрыты, бот пишет в системный канал сервера с просьбой выполнить `/setup`.
 
 ## Docker
 Образ собирается GitHub Actions при каждом пуше в `main` и публикуется в `ghcr.io/luviel19/krakenbot:latest`.
